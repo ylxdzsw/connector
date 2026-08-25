@@ -38,7 +38,11 @@ impl Config {
             trust_proxy: env("CONNECTOR_TRUST_PROXY", "false")
                 .parse()
                 .context("invalid CONNECTOR_TRUST_PROXY")?,
-            client_binary: env("CONNECTOR_CLIENT_BINARY", "target/release/connector-client").into(),
+            client_binary: env(
+                "CONNECTOR_CLIENT_BINARY",
+                "target/x86_64-unknown-linux-musl/release/connector-client",
+            )
+            .into(),
             oauth_client_id: std::env::var("CONNECTOR_OAUTH_CLIENT_ID").ok(),
             oauth_client_secret: std::env::var("CONNECTOR_OAUTH_CLIENT_SECRET").ok(),
             oauth_redirect_uri: std::env::var("CONNECTOR_OAUTH_REDIRECT_URI").ok(),

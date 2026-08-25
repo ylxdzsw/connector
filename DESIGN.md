@@ -93,6 +93,10 @@ the connection code and reads it from `/dev/tty`, which remains interactive
 even though standard input contains the piped script. The name and code never
 need to be quoted or placed in the command line.
 
+The distributed Linux client is built against musl as a fully static
+executable. It has no glibc or shared-library dependency, although a separate
+artifact is still required for each CPU architecture.
+
 The client sends the code as a bearer credential to `/link`. The gateway looks
 it up directly, obtains the corresponding name, and then upgrades the
 connection to WebSocket.

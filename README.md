@@ -7,17 +7,20 @@ gateway exposes Streamable HTTP MCP and one local Unix socket per live client.
 ## Build
 
 ```bash
-cargo build --release
+rustup target add x86_64-unknown-linux-musl
+./scripts/build-release.sh
 ```
 
 The build produces:
 
 - `target/release/connector-gateway`
-- `target/release/connector-client`
+- `target/x86_64-unknown-linux-musl/release/connector-client`
 
-Set `CONNECTOR_CLIENT_BINARY` to the client binary that `/connect` should
-download. The gateway and served client binary must target the appropriate Unix
-architecture.
+The client is a fully static musl executable, so it does not depend on the
+target host's glibc version or shared libraries. It still targets x86-64 Linux;
+set `CONNECTOR_CLIENT_TARGET` to another installed musl target when building
+for a different architecture. Set `CONNECTOR_CLIENT_BINARY` to the resulting
+client binary that `/connect` should download.
 
 ## Configure
 
@@ -29,7 +32,7 @@ The gateway is configured through environment variables:
 | `CONNECTOR_PUBLIC_URL` | `http://127.0.0.1:3000` | Public issuer URL; production must use HTTPS |
 | `CONNECTOR_DATABASE` | `data/connector.db` | SQLite state file |
 | `CONNECTOR_SOCKET_DIR` | `/run/connector` | Live channel sockets |
-| `CONNECTOR_CLIENT_BINARY` | `target/release/connector-client` | Binary served by `/download/client` |
+| `CONNECTOR_CLIENT_BINARY` | `target/x86_64-unknown-linux-musl/release/connector-client` | Static binary served by `/download/client` |
 | `CONNECTOR_SUBJECT_HEADER` | `x-connector-subject` | Identity header set only by the trusted proxy |
 | `CONNECTOR_TRUST_PROXY` | `false` | Use the first `X-Forwarded-For` address for link throttling |
 | `CONNECTOR_OAUTH_CLIENT_ID` | unset | Predefined confidential OAuth client ID |
