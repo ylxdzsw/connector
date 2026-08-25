@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use rmcp::{
     ErrorData as McpError, RoleClient, RoleServer, ServerHandler,
     model::{
@@ -12,10 +13,13 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::execution::{DEFAULT_TIMEOUT, RunArgs, RunOutput, run_bash};
+use crate::{
+    execution::{DEFAULT_TIMEOUT, RunArgs, RunOutput, run_bash},
+    screenshot,
+};
 
 #[derive(Clone)]
 pub struct LiveClient {
@@ -37,8 +41,18 @@ pub struct ChannelMcp {
     peer: Peer<RoleClient>,
 }
 
-#[derive(Clone, Default)]
-pub struct ClientMcp;
+#[derive(Clone)]
+pub struct ClientMcp {
+    screenshot: Arc<Semaphore>,
+}
+
+impl Default for ClientMcp {
+    fn default() -> Self {
+        Self {
+            screenshot: Arc::new(Semaphore::new(1)),
+        }
+    }
+}
 
 const CLIENT_ENVIRONMENT_META: &str = "com.ylxdzsw.connector/client-environment";
 
@@ -76,6 +90,17 @@ struct GatewayRunArgs {
     #[schemars(flatten)]
     run: RunArgs,
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GatewayScreenshotArgs {
+    #[schemars(description = "Connected client name")]
+    client: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ScreenshotArgs {}
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct ClientsOutput {
@@ -125,6 +150,17 @@ impl GatewayMcp {
                 };
                 relay_run(&client.peer, args.run).await
             }
+            "screenshot" => {
+                let args: GatewayScreenshotArgs = parse_args(request.arguments)?;
+                let client = self.clients.read().await.get(&args.client).cloned();
+                let Some(client) = client else {
+                    return Ok(tool_error(format!(
+                        "client '{}' is not connected",
+                        args.client
+                    )));
+                };
+                relay_screenshot(&client.peer).await
+            }
             _ => Err(McpError::method_not_found::<CallToolRequestMethod>()),
         }
     }
@@ -149,6 +185,7 @@ impl ServerHandler for GatewayMcp {
         Ok(ListToolsResult::with_all_items(vec![
             clients_tool(),
             gateway_run_tool(),
+            gateway_screenshot_tool(),
         ]))
     }
 
@@ -156,6 +193,7 @@ impl ServerHandler for GatewayMcp {
         match name {
             "clients" => Some(clients_tool()),
             "run" => Some(gateway_run_tool()),
+            "screenshot" => Some(gateway_screenshot_tool()),
             _ => None,
         }
     }
@@ -179,11 +217,18 @@ impl ServerHandler for ChannelMcp {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(vec![run_tool(false)]))
+        Ok(ListToolsResult::with_all_items(vec![
+            run_tool(false),
+            screenshot_tool(false),
+        ]))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        (name == "run").then(|| run_tool(false))
+        match name {
+            "run" => Some(run_tool(false)),
+            "screenshot" => Some(screenshot_tool(false)),
+            _ => None,
+        }
     }
 
     async fn call_tool(
@@ -191,11 +236,17 @@ impl ServerHandler for ChannelMcp {
         request: CallToolRequestParams,
         _: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        if request.name != "run" {
-            return Err(McpError::method_not_found::<CallToolRequestMethod>());
+        match request.name.as_ref() {
+            "run" => {
+                let args: RunArgs = parse_args(request.arguments)?;
+                relay_run(&self.peer, args).await.map(Into::into)
+            }
+            "screenshot" => {
+                let _: ScreenshotArgs = parse_args(request.arguments)?;
+                relay_screenshot(&self.peer).await.map(Into::into)
+            }
+            _ => Err(McpError::method_not_found::<CallToolRequestMethod>()),
         }
-        let args: RunArgs = parse_args(request.arguments)?;
-        relay_run(&self.peer, args).await.map(Into::into)
     }
 }
 
@@ -203,7 +254,7 @@ impl ServerHandler for ClientMcp {
     fn get_info(&self) -> ServerInfo {
         let mut info = server_info(
             "connector-client",
-            "Run fresh commands with Bash on this Linux client",
+            "Run fresh commands with Bash and capture screenshots on this Linux client",
         );
         let mut meta = JsonObject::new();
         meta.insert(
@@ -219,11 +270,18 @@ impl ServerHandler for ClientMcp {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(vec![run_tool(false)]))
+        Ok(ListToolsResult::with_all_items(vec![
+            run_tool(false),
+            screenshot_tool(false),
+        ]))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        (name == "run").then(|| run_tool(false))
+        match name {
+            "run" => Some(run_tool(false)),
+            "screenshot" => Some(screenshot_tool(false)),
+            _ => None,
+        }
     }
 
     async fn call_tool(
@@ -231,6 +289,33 @@ impl ServerHandler for ClientMcp {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        if request.name == "screenshot" {
+            let _: ScreenshotArgs = parse_args(request.arguments)?;
+            let _permit = self
+                .screenshot
+                .acquire()
+                .await
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            let result = match screenshot::capture().await {
+                Ok(screenshot) => {
+                    tracing::info!(
+                        request_id = ?context.id,
+                        backend = screenshot.backend,
+                        bytes = screenshot.data.len(),
+                        "screenshot captured"
+                    );
+                    CallToolResult::success(vec![ContentBlock::image(
+                        STANDARD.encode(screenshot.data),
+                        screenshot.mime_type,
+                    )])
+                }
+                Err(error) => {
+                    tracing::warn!(request_id = ?context.id, %error, "screenshot failed");
+                    tool_error(error)
+                }
+            };
+            return Ok(result.into());
+        }
         if request.name != "run" {
             return Err(McpError::method_not_found::<CallToolRequestMethod>());
         }
@@ -274,6 +359,16 @@ async fn relay_run(peer: &Peer<RoleClient>, args: RunArgs) -> Result<CallToolRes
     {
         Ok(result) => Ok(result),
         Err(error) => Ok(tool_error(format!("client became unavailable: {error}"))),
+    }
+}
+
+async fn relay_screenshot(peer: &Peer<RoleClient>) -> Result<CallToolResult, McpError> {
+    match peer
+        .call_tool(CallToolRequestParams::new("screenshot"))
+        .await
+    {
+        Ok(result) => Ok(result),
+        Err(error) => Ok(tool_error(format!("screenshot unavailable: {error}"))),
     }
 }
 
@@ -325,6 +420,17 @@ fn gateway_run_tool() -> Tool {
     )
 }
 
+fn gateway_screenshot_tool() -> Tool {
+    secure(
+        Tool::new(
+            "screenshot",
+            "Capture the full graphical desktop of a connected client; returns unavailable when the client cannot capture it",
+            schema::<GatewayScreenshotArgs>(),
+        )
+        .with_annotations(screenshot_annotations()),
+    )
+}
+
 fn run_tool(protected: bool) -> Tool {
     let tool = Tool::new(
         "run",
@@ -333,6 +439,24 @@ fn run_tool(protected: bool) -> Tool {
     )
     .with_raw_output_schema(schema::<RunOutput>());
     if protected { secure(tool) } else { tool }
+}
+
+fn screenshot_tool(protected: bool) -> Tool {
+    let tool = Tool::new(
+        "screenshot",
+        "Capture the full graphical desktop; returns unavailable when no supported screenshot program can access it",
+        empty_schema(),
+    )
+    .with_annotations(screenshot_annotations());
+    if protected { secure(tool) } else { tool }
+}
+
+fn screenshot_annotations() -> ToolAnnotations {
+    ToolAnnotations::new()
+        .read_only(true)
+        .destructive(false)
+        .idempotent(true)
+        .open_world(false)
 }
 
 fn secure(mut tool: Tool) -> Tool {
@@ -371,8 +495,11 @@ mod tests {
         assert!(gateway.get_tool("run").is_some());
         assert!(gateway.get_tool("bash").is_none());
 
-        let client = ClientMcp;
+        assert!(gateway.get_tool("screenshot").is_some());
+
+        let client = ClientMcp::default();
         assert!(client.get_tool("run").is_some());
+        assert!(client.get_tool("screenshot").is_some());
         assert!(client.get_tool("bash").is_none());
         let info = client.get_info();
         let environment: ClientEnvironment =

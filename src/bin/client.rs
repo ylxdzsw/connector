@@ -165,7 +165,7 @@ async fn connect(endpoint: &str, code: &str) -> Result<(), LinkError> {
             _ => None,
         }
     });
-    let service = ClientMcp
+    let service = ClientMcp::default()
         .serve((Box::pin(sink), Box::pin(stream)))
         .await
         .map_err(|e| LinkError::Other(e.into()))?;

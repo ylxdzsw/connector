@@ -11,8 +11,9 @@ Controller -- MCP/HTTPS --> Nginx -- Unix socket --> Gateway -- MCP/WebSocket --
                                                    +-- newline JSON-RPC on Unix sockets
 ```
 
-The first version supports Unix clients and two controller tools. Windows,
-persistent terminals, screenshots, and remote input are future work.
+The first version supports Unix clients, fresh shell commands, and best-effort
+desktop screenshots. Windows, persistent terminals, and remote input are
+future work.
 
 ## Participants
 
@@ -40,7 +41,7 @@ The public MCP resource is:
 https://connector.ylxdzsw.com/mcp
 ```
 
-The OAuth scope `control` grants access to both controller tools.
+The OAuth scope `control` grants access to all controller tools.
 
 ## Credentials
 
@@ -189,8 +190,9 @@ The gateway validates the OAuth client, exact redirect URI, scope, resource,
 and PKCE method. It then asks the user to approve this grant:
 
 ```text
-Allow this controller to run shell commands on all current and future connected
-clients until access is revoked?
+Allow this controller to run shell commands and capture graphical desktop
+screenshots on all current and future connected clients until access is
+revoked?
 ```
 
 The consent POST uses CSRF protection. Consent is recorded for the authenticated
@@ -251,11 +253,12 @@ revocation closes that client's link. The two operations are independent.
 The gateway exposes standard MCP Streamable HTTP at `/mcp`. It is the MCP
 server; the controller is the MCP client.
 
-The gateway exposes two tools:
+The gateway exposes three tools:
 
 ```text
 clients()
 run(client, command, cwd?, timeout?, stdin?)
+screenshot(client)
 ```
 
 `clients` returns each connected client's name, system, and shell. For example:
@@ -271,7 +274,12 @@ before a later `run` call.
 client's advertised shell. An unknown or disconnected client produces a
 tool-level availability error.
 
-Both tools declare OAuth security metadata requiring the `control` scope.
+`screenshot` asks a client to capture its full graphical desktop and returns a
+standard MCP PNG or JPEG image. The tool is always present; a headless client,
+an unsupported platform, or a client without a usable capture program returns
+a tool-level availability error.
+
+All tools declare OAuth security metadata requiring the `control` scope.
 
 ### Gateway to client
 
@@ -283,18 +291,20 @@ text frame contains one complete UTF-8 MCP message. The client credential is
 authenticated during upgrade, and WebSocket Ping/Pong provides liveness. No
 private heartbeat or authentication messages are mixed into MCP.
 
-The client exposes one tool:
+The client exposes two tools:
 
 ```text
 run(command, cwd?, timeout?, stdin?)
+screenshot()
 ```
 
 The client reports its system and shell in standard MCP initialization
 metadata. The gateway terminates the external and internal MCP sessions. It
 handles `clients` itself and maps external `run` calls to the selected client's
-`run` tool, including request IDs, results, errors, and cancellation. A client
-that omits its environment metadata or provides malformed values is rejected
-during link initialization.
+`run` tool. It also relays `screenshot` calls and their MCP image content.
+Request IDs, results, errors, and cancellation are mapped through both
+sessions. A client that omits its environment metadata or provides malformed
+values is rejected during link initialization.
 
 ### Local Unix socket
 
@@ -304,8 +314,8 @@ While a client is connected, the gateway listens on:
 /run/connector/<name>.sock
 ```
 
-The socket exposes that client's `run(command, cwd?, timeout?, stdin?)` MCP
-server using newline-delimited JSON-RPC.
+The socket exposes that client's `run(command, cwd?, timeout?, stdin?)` and
+`screenshot()` tools using newline-delimited MCP JSON-RPC.
 Channel sockets are mode `0600`. The runtime directory is mode `0710`, allowing
 the Nginx worker group to traverse to the mode-`0660` HTTP gateway socket
 without listing the directory or accessing channels. The gateway removes a
@@ -330,6 +340,26 @@ code is a normal tool result. MCP errors are reserved for invocation failures.
 Mu's `title` and `risk` fields are omitted because they are controller UI and
 policy metadata rather than execution inputs.
 
+## Screenshot Capture
+
+Each `screenshot` call detects the graphical session and invokes common capture
+software found in the client's `PATH`. Wayland uses desktop-native tools and
+`grim`; X11 uses desktop-native tools, `maim`, `scrot`, or ImageMagick. Commands
+are invoked directly without a shell. A Wayland session never falls back to
+X11 through Xwayland because that can return an incomplete desktop.
+
+Capture is best-effort and has no persistent session state. One capture runs at
+a time. Programs have bounded execution time, write into a private temporary
+directory, and are killed with their process group on timeout or cancellation.
+Only valid PNG and JPEG output is accepted. Images are limited to 8 MiB; when
+available, ImageMagick may reduce an oversized valid capture to a bounded JPEG.
+
+Connector does not persist screenshots or log their bytes. It logs only the
+selected backend and image size. Screenshots can expose notifications,
+credentials, private application content, and everything else visible to the
+Unix user's graphical session, so controller grants and client logs must be
+protected accordingly.
+
 ## State
 
 SQLite persists:
@@ -341,9 +371,9 @@ SQLite persists:
 - Access and refresh token hashes, expiry, rotation, and revocation
 
 Live WebSockets, request mappings, and online status remain in memory. Connector
-does not persist command logs or output; an external supervisor may retain the
-client's standard-error log. In-flight calls fail on disconnect or gateway
-restart and are never replayed.
+does not persist command logs, command output, or screenshots; an external
+supervisor may retain the client's standard-error log. In-flight calls fail on
+disconnect or gateway restart and are never replayed.
 
 ## Trust Boundaries
 
@@ -385,9 +415,10 @@ grant permits commands on all clients.
 
 ### Client to operating system
 
-Bash runs as the Unix user that launched the client. Connector does not run the
-client as root or elevate privileges. OAuth control therefore grants all
-privileges available to that Unix user.
+Bash and screenshot capture programs run as the Unix user that launched the
+client. Connector does not run the client as root or elevate privileges. OAuth
+control therefore grants all privileges available to that Unix user and can
+expose everything visible in that user's graphical session.
 
 ### Local processes
 
@@ -408,6 +439,8 @@ to a channel socket can control that client without OAuth.
 - **Exact MCP at both boundaries** avoids a second command protocol.
 - **Non-persistent Bash** matches Mu-style workflows without terminal session
   APIs.
+- **External screenshot programs** cover common Linux desktops without adding
+  native X11, Wayland, portal, or image-codec dependencies to the static client.
 - **Unix sockets** expose live channels to local controllers and represent them
   in the filesystem.
 

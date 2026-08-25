@@ -4,3 +4,4 @@ pub mod db;
 pub mod execution;
 pub mod gateway;
 pub mod mcp;
+pub mod screenshot;

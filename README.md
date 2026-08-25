@@ -1,8 +1,9 @@
 # Connector
 
-Connector lets an OAuth-authorized MCP controller run fresh shell commands on
-Unix clients behind NAT. Clients establish outbound WebSocket links; the
-gateway exposes Streamable HTTP MCP and one local Unix socket per live client.
+Connector lets an OAuth-authorized MCP controller run fresh shell commands and
+capture best-effort desktop screenshots on Unix clients behind NAT. Clients
+establish outbound WebSocket links; the gateway exposes Streamable HTTP MCP and
+one local Unix socket per live client.
 
 ## Build
 
@@ -73,18 +74,29 @@ timeout, and full standard input before execution. After execution it logs the
 combined standard output and error plus the exit code. Operators must protect
 these process logs because they can contain sensitive data.
 
+The client also offers best-effort full-desktop screenshots by invoking common
+capture software from its `PATH`. On Wayland it tries desktop-native tools and
+`grim`; on X11 it also tries `maim`, `scrot`, and ImageMagick. No capture
+software is bundled into the static client. The tool returns unavailable on a
+headless or unsupported client. Screenshot bytes are not persisted or logged,
+but controllers can receive everything visible in the user's graphical
+session.
+
 ## MCP
 
-Controllers connect to `https://connector.ylxdzsw.com/mcp` and receive two
+Controllers connect to `https://connector.ylxdzsw.com/mcp` and receive three
 tools:
 
 - `clients()` returns current online clients as
   `{ "clients": [{ "name": string, "system": string, "shell": string }] }`.
 - `run(client, command, cwd?, timeout?, stdin?)` invokes the selected client's
   shell once and returns `{ "output": string, "exit_code": number }`.
+- `screenshot(client)` returns the selected client's full graphical desktop as
+  an MCP PNG or JPEG image, or a tool error when capture is unavailable.
 
 While a client is online, `/run/connector/<name>.sock` exposes that client's
-`run(command, cwd?, timeout?, stdin?)` MCP server as newline-delimited JSON-RPC.
+`run(command, cwd?, timeout?, stdin?)` and `screenshot()` tools as
+newline-delimited MCP JSON-RPC.
 Channel sockets are mode `0600`. The shared runtime directory is mode `0710`:
 the Nginx worker group can traverse it to the mode-`0660` `.gateway.sock`, but
 cannot list the directory or access channel sockets.
