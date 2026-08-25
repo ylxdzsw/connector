@@ -6,9 +6,9 @@ Connector lets an authenticated MCP controller run non-persistent Bash
 commands on Unix clients behind NAT.
 
 ```text
-Controller -- MCP/HTTPS --> Gateway -- MCP/WebSocket --> Client -- bash -lc
-                                      |
-                                      +-- Unix socket
+Controller -- MCP/HTTPS --> Nginx -- Unix socket --> Gateway -- MCP/WebSocket --> Client -- bash -lc
+                                                   |
+                                                   +-- newline JSON-RPC on Unix sockets
 ```
 
 The first version supports Unix clients and two controller tools. Windows,
@@ -18,9 +18,10 @@ persistent terminals, screenshots, and remote input are future work.
 
 - **Client**: a program started by the script served by the gateway. It opens
   an outbound link, receives MCP tool calls, and executes Bash.
-- **Gateway**: `connector.ylxdzsw.com`, running on this server. It authenticates
-  participants, relays MCP through NAT, serves the connection script, and
-  exposes local Unix sockets.
+- **Gateway**: `connector.ylxdzsw.com`, running behind Nginx on this server. It
+  accepts HTTP only on a private Unix socket, authenticates participants,
+  relays MCP through NAT, serves the connection script, and exposes local Unix
+  sockets.
 - **Controller**: an MCP client such as Mu or ChatGPT. Once authorized, it can
   control every connected client.
 - **Channel**: a named route to one connected client. A channel is not a
@@ -107,10 +108,11 @@ The gateway is its own OAuth 2.1 authorization server and resource server. It
 issues short-lived opaque access tokens and rotating refresh tokens. Stored
 authorization codes and tokens are hashed.
 
-ChatGPT is a predefined confidential OAuth client. Its client ID, secret hash,
-and exact redirect URI are configured in the gateway and its credentials are
-entered when the custom connector is created. V1 does not implement dynamic
-client registration or Client ID Metadata Documents.
+ChatGPT is a predefined confidential OAuth client. Its client ID and exact
+redirect URI are fixed in the gateway; only its secret is read from the
+environment, and only the secret hash is persisted. Its credentials are entered
+when the custom connector is created. V1 does not implement dynamic client
+registration or Client ID Metadata Documents.
 
 ## OAuth Discovery
 
@@ -294,8 +296,10 @@ While a client is connected, the gateway listens on:
 ```
 
 The socket exposes that client's MCP server using newline-delimited JSON-RPC.
-Local access is controlled by filesystem permissions. The gateway removes the
-socket on disconnect.
+Channel sockets are mode `0600`. The runtime directory is mode `0710`, allowing
+the Nginx worker group to traverse to the mode-`0660` HTTP gateway socket
+without listing the directory or accessing channels. The gateway removes a
+channel socket on disconnect.
 
 ## Bash Execution
 
@@ -341,10 +345,11 @@ clients.
 
 ### Nginx to gateway
 
-The gateway trusts Nginx's identity header only on management and authorization
-routes reached through a private listener or Unix socket. Nginx strips
-client-supplied identity headers. OAuth discovery, token, MCP, and client-link
-routes do not accept the Nginx identity header as authentication.
+The gateway accepts HTTP only through a mode-`0660` Unix socket in a directory
+searchable by the Nginx worker group. It trusts Nginx's identity header only on
+management and authorization routes. Nginx strips client-supplied identity
+headers. OAuth discovery, token, MCP, and client-link routes do not accept the
+Nginx identity header as authentication.
 
 ### Controller to gateway
 

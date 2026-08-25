@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    net::SocketAddr,
     os::unix::fs::PermissionsExt,
     sync::Arc,
     time::{Duration, Instant},
@@ -10,10 +9,10 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::{
-        ConnectInfo, Form, Path, Query, Request, State, WebSocketUpgrade,
+        Form, Path, Query, Request, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -41,7 +40,10 @@ use tower_http::trace::TraceLayer;
 use url::Url;
 
 use crate::{
-    config::Config,
+    config::{
+        CLIENT_BINARY, Config, DATABASE, OAUTH_CLIENT_ID, OAUTH_REDIRECT_URI, PUBLIC_URL,
+        RESOURCE_URL, SOCKET_DIR, SUBJECT_HEADER,
+    },
     crypto::{connection_code, normalize_code, random_token},
     db::{AuthCodeBinding, Database, OAuthError},
     mcp::{ChannelMcp, GatewayMcp, LiveClient, LiveClients},
@@ -49,7 +51,6 @@ use crate::{
 
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<Config>,
     pub db: Database,
     pub clients: LiveClients,
     pending: Arc<Mutex<HashSet<String>>>,
@@ -59,28 +60,18 @@ pub struct AppState {
 
 impl AppState {
     pub async fn new(config: Config) -> Result<Self> {
-        let db = Database::open(&config.database)?;
-        match (
-            &config.oauth_client_id,
+        let db = Database::open(DATABASE)?;
+        db.register_oauth_client(
+            OAUTH_CLIENT_ID,
             &config.oauth_client_secret,
-            &config.oauth_redirect_uri,
-        ) {
-            (Some(id), Some(secret), Some(uri)) => {
-                db.register_oauth_client(id, secret, uri).await?
-            }
-            (None, None, None) => tracing::warn!(
-                "OAuth client is not configured; controller authorization is unavailable"
-            ),
-            _ => anyhow::bail!(
-                "CONNECTOR_OAUTH_CLIENT_ID, CONNECTOR_OAUTH_CLIENT_SECRET, and CONNECTOR_OAUTH_REDIRECT_URI must be set together"
-            ),
-        }
-        tokio::fs::create_dir_all(&config.socket_dir)
+            OAUTH_REDIRECT_URI,
+        )
+        .await?;
+        tokio::fs::create_dir_all(SOCKET_DIR)
             .await
-            .with_context(|| format!("create {}", config.socket_dir.display()))?;
-        std::fs::set_permissions(&config.socket_dir, std::fs::Permissions::from_mode(0o700))?;
+            .with_context(|| format!("create {SOCKET_DIR}"))?;
+        std::fs::set_permissions(SOCKET_DIR, std::fs::Permissions::from_mode(0o710))?;
         Ok(Self {
-            config: Arc::new(config),
             db,
             clients: Arc::new(RwLock::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashSet::new())),
@@ -106,11 +97,7 @@ pub fn router(state: AppState) -> Router {
             move || Ok(GatewayMcp::new(mcp_clients.clone())),
             Default::default(),
             StreamableHttpServerConfig::default()
-                .with_allowed_hosts([
-                    host_of(&state.config.public_url),
-                    "localhost".into(),
-                    "127.0.0.1".into(),
-                ])
+                .with_allowed_hosts([host_of(PUBLIC_URL), "localhost".into(), "127.0.0.1".into()])
                 .with_cancellation_token(state.shutdown.child_token()),
         );
     let protected_mcp = Router::new()
@@ -148,7 +135,7 @@ async fn mcp_auth(State(state): State<AppState>, request: Request, next: Next) -
     if let Some(token) = token
         && state
             .db
-            .validate_access_token(&token, &state.config.resource(), "control")
+            .validate_access_token(&token, RESOURCE_URL, "control")
             .await
             .unwrap_or(false)
     {
@@ -159,7 +146,7 @@ async fn mcp_auth(State(state): State<AppState>, request: Request, next: Next) -
         header::WWW_AUTHENTICATE,
         HeaderValue::from_str(&format!(
             "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\", scope=\"control\"",
-            state.config.public_url
+            PUBLIC_URL
         )).unwrap(),
     );
     response
@@ -172,18 +159,16 @@ struct ProtectedResourceMetadata {
     scopes_supported: Vec<&'static str>,
 }
 
-async fn protected_resource_metadata(
-    State(state): State<AppState>,
-) -> Json<ProtectedResourceMetadata> {
+async fn protected_resource_metadata() -> Json<ProtectedResourceMetadata> {
     Json(ProtectedResourceMetadata {
-        resource: state.config.resource(),
-        authorization_servers: vec![state.config.public_url.clone()],
+        resource: RESOURCE_URL.into(),
+        authorization_servers: vec![PUBLIC_URL.into()],
         scopes_supported: vec!["control"],
     })
 }
 
-async fn authorization_server_metadata(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let base = &state.config.public_url;
+async fn authorization_server_metadata() -> Json<serde_json::Value> {
+    let base = PUBLIC_URL;
     Json(json!({
         "issuer": base,
         "authorization_endpoint": format!("{base}/oauth/authorize"),
@@ -223,7 +208,7 @@ async fn authorize(
     headers: HeaderMap,
     Query(query): Query<AuthorizeParams>,
 ) -> Response {
-    let subject = match subject(&state, &headers) {
+    let subject = match subject(&headers) {
         Ok(subject) => subject,
         Err(status) => return status.into_response(),
     };
@@ -234,7 +219,7 @@ async fn authorize(
             &message,
         );
     }
-    let (csrf, set_cookie) = csrf_for(&state, &headers);
+    let (csrf, set_cookie) = csrf_for(&headers);
     let hidden = oauth_hidden(&query);
     let offline = if query
         .scope
@@ -273,7 +258,7 @@ async fn authorize_consent(
     headers: HeaderMap,
     Form(form): Form<ConsentForm>,
 ) -> Response {
-    let subject = match subject(&state, &headers) {
+    let subject = match subject(&headers) {
         Ok(subject) => subject,
         Err(status) => return status.into_response(),
     };
@@ -297,7 +282,7 @@ async fn authorize_consent(
             .query_pairs_mut()
             .append_pair("error", "access_denied")
             .append_pair("state", &form.oauth.state)
-            .append_pair("iss", &state.config.public_url);
+            .append_pair("iss", PUBLIC_URL);
         return Redirect::to(redirect.as_str()).into_response();
     }
     let scopes = canonical_scopes(&form.oauth.scope).expect("validated scopes");
@@ -326,14 +311,14 @@ async fn authorize_consent(
         .query_pairs_mut()
         .append_pair("code", &code)
         .append_pair("state", &form.oauth.state)
-        .append_pair("iss", &state.config.public_url);
+        .append_pair("iss", PUBLIC_URL);
     Redirect::to(redirect.as_str()).into_response()
 }
 
 async fn validate_authorize(state: &AppState, query: &AuthorizeParams) -> Result<(), String> {
     if query.response_type != "code"
         || query.code_challenge_method != "S256"
-        || query.resource != state.config.resource()
+        || query.resource != RESOURCE_URL
     {
         return Err("Unsupported response type, PKCE method, or resource.".into());
     }
@@ -418,7 +403,7 @@ async fn token(
         );
     }
     let resource = match form.resource.as_deref() {
-        Some(value) if value == state.config.resource() => value,
+        Some(value) if value == RESOURCE_URL => value,
         _ => {
             return oauth_error(
                 StatusCode::BAD_REQUEST,
@@ -517,7 +502,7 @@ struct CreateClientForm {
 }
 
 async fn management(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let owner = match subject(&state, &headers) {
+    let owner = match subject(&headers) {
         Ok(v) => v,
         Err(status) => return status.into_response(),
     };
@@ -529,7 +514,7 @@ async fn create_client(
     headers: HeaderMap,
     Form(form): Form<CreateClientForm>,
 ) -> Response {
-    let owner = match subject(&state, &headers) {
+    let owner = match subject(&headers) {
         Ok(v) => v,
         Err(status) => return status.into_response(),
     };
@@ -581,7 +566,7 @@ async fn extend_client(
     Path(name): Path<String>,
     Form(form): Form<ExtendClientForm>,
 ) -> Response {
-    if subject(&state, &headers).is_err() {
+    if subject(&headers).is_err() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     if !check_csrf(&headers, &form.csrf) {
@@ -615,7 +600,7 @@ async fn revoke_client(
     Path(name): Path<String>,
     Form(form): Form<CsrfForm>,
 ) -> Response {
-    if subject(&state, &headers).is_err() {
+    if subject(&headers).is_err() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     if !check_csrf(&headers, &form.csrf) {
@@ -634,7 +619,7 @@ async fn revoke_grant(
     Path(id): Path<i64>,
     Form(form): Form<CsrfForm>,
 ) -> Response {
-    if subject(&state, &headers).is_err() {
+    if subject(&headers).is_err() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     if !check_csrf(&headers, &form.csrf) {
@@ -653,7 +638,7 @@ async fn render_management(
     let clients = state.db.list_clients().await.unwrap_or_default();
     let grants = state.db.list_grants().await.unwrap_or_default();
     let online: HashSet<_> = state.clients.read().await.keys().cloned().collect();
-    let (csrf, set_cookie) = csrf_for(state, headers);
+    let (csrf, set_cookie) = csrf_for(headers);
     let notice = created.map(|(name, code)| format!(
         "<div class=\"notice\"><strong>Client {} created</strong>Connection code: <code>{}</code>. This is the only time the code is shown.</div>", escape(name), escape(code)
     )).unwrap_or_default();
@@ -689,7 +674,7 @@ async fn render_management(
         notice,
         online_count,
         if online_count == 1 { "" } else { "s" },
-        escape(&state.config.public_url),
+        escape(PUBLIC_URL),
         escape(&csrf),
         client_rows,
         grant_rows
@@ -697,13 +682,8 @@ async fn render_management(
     html_response("Connector", &body, set_cookie)
 }
 
-async fn link(
-    State(state): State<AppState>,
-    ConnectInfo(address): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Response {
-    let key = client_ip(&state, &headers, address);
+async fn link(State(state): State<AppState>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+    let key = client_ip(&headers);
     if throttled(&state, &key).await {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -770,7 +750,7 @@ async fn establish_client(
         disconnect.cancel();
         return Ok(());
     }
-    let (listener, path) = bind_unix_socket(state, name).await?;
+    let (listener, path) = bind_unix_socket(name).await?;
     let id = random_token();
     state.clients.write().await.insert(
         name.to_owned(),
@@ -858,11 +838,8 @@ async fn websocket_io(
     }
 }
 
-async fn bind_unix_socket(
-    state: &AppState,
-    name: &str,
-) -> Result<(UnixListener, std::path::PathBuf)> {
-    let path = state.config.socket_dir.join(format!("{name}.sock"));
+async fn bind_unix_socket(name: &str) -> Result<(UnixListener, std::path::PathBuf)> {
+    let path = std::path::Path::new(SOCKET_DIR).join(format!("{name}.sock"));
     if path.exists() {
         let _ = tokio::fs::remove_file(&path).await;
     }
@@ -895,8 +872,8 @@ async fn serve_unix_socket(
     let _ = tokio::fs::remove_file(path).await;
 }
 
-async fn connect_script(State(state): State<AppState>) -> Response {
-    let script = connect_script_body(&state.config.public_url);
+async fn connect_script() -> Response {
+    let script = connect_script_body(PUBLIC_URL);
     (
         [
             (header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8"),
@@ -923,8 +900,8 @@ fi
     )
 }
 
-async fn download_client(State(state): State<AppState>) -> Response {
-    match tokio::fs::read(&state.config.client_binary).await {
+async fn download_client() -> Response {
+    match tokio::fs::read(CLIENT_BINARY).await {
         Ok(binary) => (
             [
                 (header::CONTENT_TYPE, "application/octet-stream"),
@@ -955,11 +932,9 @@ async fn styles() -> Response {
         .into_response()
 }
 
-fn subject(state: &AppState, headers: &HeaderMap) -> Result<String, StatusCode> {
-    let name = HeaderName::from_bytes(state.config.subject_header.as_bytes())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+fn subject(headers: &HeaderMap) -> Result<String, StatusCode> {
     headers
-        .get(name)
+        .get(SUBJECT_HEADER)
         .and_then(|value| value.to_str().ok())
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
@@ -986,18 +961,13 @@ fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
     Some((id.to_owned(), secret.to_owned()))
 }
 
-fn csrf_for(state: &AppState, headers: &HeaderMap) -> (String, Option<String>) {
+fn csrf_for(headers: &HeaderMap) -> (String, Option<String>) {
     if let Some(value) = cookie(headers, "connector_csrf") {
         return (value.to_owned(), None);
     }
     let token = random_token();
-    let secure = if state.config.public_url.starts_with("https://") {
-        "; Secure"
-    } else {
-        ""
-    };
     let cookie =
-        format!("connector_csrf={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=3600{secure}");
+        format!("connector_csrf={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=3600; Secure");
     (token, Some(cookie))
 }
 
@@ -1110,16 +1080,15 @@ fn host_of(public_url: &str) -> String {
         .unwrap_or_else(|| "localhost".into())
 }
 
-fn client_ip(state: &AppState, headers: &HeaderMap, peer: SocketAddr) -> String {
-    if state.config.trust_proxy
-        && let Some(value) = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
+fn client_ip(headers: &HeaderMap) -> String {
+    if let Some(value) = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
     {
         return value.trim().to_owned();
     }
-    peer.ip().to_string()
+    "unix".into()
 }
 
 async fn throttled(state: &AppState, key: &str) -> bool {
