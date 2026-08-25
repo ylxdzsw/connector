@@ -2,7 +2,7 @@
 
 ## Goal
 
-Connector lets an authenticated MCP controller run non-persistent Bash
+Connector lets an authenticated MCP controller run non-persistent shell
 commands on Unix clients behind NAT.
 
 ```text
@@ -17,7 +17,7 @@ persistent terminals, screenshots, and remote input are future work.
 ## Participants
 
 - **Client**: a program started by the script served by the gateway. It opens
-  an outbound link, receives MCP tool calls, and executes Bash.
+  an outbound link, receives MCP tool calls, and executes its advertised shell.
 - **Gateway**: `connector.ylxdzsw.com`, running behind Nginx on this server. It
   accepts HTTP only on a private Unix socket, authenticates participants,
   relays MCP through NAT, serves the connection script, and exposes local Unix
@@ -189,7 +189,7 @@ The gateway validates the OAuth client, exact redirect URI, scope, resource,
 and PKCE method. It then asks the user to approve this grant:
 
 ```text
-Allow this controller to run Bash commands on all current and future connected
+Allow this controller to run shell commands on all current and future connected
 clients until access is revoked?
 ```
 
@@ -255,15 +255,21 @@ The gateway exposes two tools:
 
 ```text
 clients()
-bash(client, command, cwd?, timeout?, stdin?)
+run(client, command, cwd?, timeout?, stdin?)
 ```
 
-`clients` returns the names of clients that are connected when the call is
-handled. The result is only a snapshot; callers must handle a client
-disconnecting before a later `bash` call.
+`clients` returns each connected client's name, system, and shell. For example:
 
-`bash` selects a client by name and relays one non-persistent Bash invocation.
-An unknown or disconnected client produces a tool-level availability error.
+```json
+{"clients":[{"name":"build-server","system":"linux","shell":"bash"}]}
+```
+
+The result is only a snapshot; callers must handle a client disconnecting
+before a later `run` call.
+
+`run` selects a client by name and relays one non-persistent command to that
+client's advertised shell. An unknown or disconnected client produces a
+tool-level availability error.
 
 Both tools declare OAuth security metadata requiring the `control` scope.
 
@@ -280,12 +286,15 @@ private heartbeat or authentication messages are mixed into MCP.
 The client exposes one tool:
 
 ```text
-bash(command, cwd?, timeout?, stdin?)
+run(command, cwd?, timeout?, stdin?)
 ```
 
-The gateway terminates the external and internal MCP sessions. It handles
-`clients` itself and maps external `bash` calls to the selected client's
-`bash` tool, including request IDs, results, errors, and cancellation.
+The client reports its system and shell in standard MCP initialization
+metadata. The gateway terminates the external and internal MCP sessions. It
+handles `clients` itself and maps external `run` calls to the selected client's
+`run` tool, including request IDs, results, errors, and cancellation. A client
+that omits its environment metadata or provides malformed values is rejected
+during link initialization.
 
 ### Local Unix socket
 
@@ -295,7 +304,8 @@ While a client is connected, the gateway listens on:
 /run/connector/<name>.sock
 ```
 
-The socket exposes that client's MCP server using newline-delimited JSON-RPC.
+The socket exposes that client's `run(command, cwd?, timeout?, stdin?)` MCP
+server using newline-delimited JSON-RPC.
 Channel sockets are mode `0600`. The runtime directory is mode `0710`, allowing
 the Nginx worker group to traverse to the mode-`0660` HTTP gateway socket
 without listing the directory or accessing channels. The gateway removes a

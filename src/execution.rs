@@ -7,8 +7,8 @@ pub const DEFAULT_TIMEOUT: u64 = 60;
 pub const MAX_TIMEOUT: u64 = 3600;
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct BashArgs {
-    #[schemars(description = "Bash command to execute in a fresh shell")]
+pub struct RunArgs {
+    #[schemars(description = "Command text to execute in a fresh shell")]
     pub command: String,
     #[schemars(description = "Working directory for the command")]
     pub cwd: Option<PathBuf>,
@@ -19,12 +19,12 @@ pub struct BashArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-pub struct BashOutput {
+pub struct RunOutput {
     pub output: String,
     pub exit_code: i32,
 }
 
-pub async fn run_bash(args: BashArgs) -> Result<BashOutput, String> {
+pub async fn run_bash(args: RunArgs) -> Result<RunOutput, String> {
     let timeout = args.timeout.unwrap_or(DEFAULT_TIMEOUT);
     if timeout == 0 || timeout > MAX_TIMEOUT {
         return Err(format!(
@@ -75,7 +75,7 @@ pub async fn run_bash(args: BashArgs) -> Result<BashOutput, String> {
     match time::timeout(Duration::from_secs(timeout), child.wait_with_output()).await {
         Ok(Ok(result)) => {
             process_group.0 = None;
-            Ok(BashOutput {
+            Ok(RunOutput {
                 output: String::from_utf8_lossy(&result.stdout).into_owned(),
                 exit_code: result
                     .status
@@ -114,7 +114,7 @@ mod tests {
 
     #[tokio::test]
     async fn execution_is_fresh_and_combines_output() {
-        let result = run_bash(BashArgs {
+        let result = run_bash(RunArgs {
             command: "printf out; printf err >&2; exit 7".into(),
             cwd: None,
             timeout: None,
@@ -124,7 +124,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             result,
-            BashOutput {
+            RunOutput {
                 output: "outerr".into(),
                 exit_code: 7
             }
@@ -133,7 +133,7 @@ mod tests {
 
     #[tokio::test]
     async fn stdin_is_literal() {
-        let result = run_bash(BashArgs {
+        let result = run_bash(RunArgs {
             command: "cat".into(),
             cwd: None,
             timeout: None,

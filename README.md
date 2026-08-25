@@ -1,6 +1,6 @@
 # Connector
 
-Connector lets an OAuth-authorized MCP controller run fresh Bash commands on
+Connector lets an OAuth-authorized MCP controller run fresh shell commands on
 Unix clients behind NAT. Clients establish outbound WebSocket links; the
 gateway exposes Streamable HTTP MCP and one local Unix socket per live client.
 
@@ -78,12 +78,13 @@ these process logs because they can contain sensitive data.
 Controllers connect to `https://connector.ylxdzsw.com/mcp` and receive two
 tools:
 
-- `clients()` returns the current online client names.
-- `bash(client, command, cwd?, timeout?, stdin?)` runs `bash -lc` once and
-  returns `{ "output": string, "exit_code": number }`.
+- `clients()` returns current online clients as
+  `{ "clients": [{ "name": string, "system": string, "shell": string }] }`.
+- `run(client, command, cwd?, timeout?, stdin?)` invokes the selected client's
+  shell once and returns `{ "output": string, "exit_code": number }`.
 
 While a client is online, `/run/connector/<name>.sock` exposes that client's
-`bash(command, cwd?, timeout?, stdin?)` MCP server as newline-delimited JSON-RPC.
+`run(command, cwd?, timeout?, stdin?)` MCP server as newline-delimited JSON-RPC.
 Channel sockets are mode `0600`. The shared runtime directory is mode `0710`:
 the Nginx worker group can traverse it to the mode-`0660` `.gateway.sock`, but
 cannot list the directory or access channel sockets.

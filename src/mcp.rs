@@ -4,8 +4,8 @@ use rmcp::{
     ErrorData as McpError, RoleClient, RoleServer, ServerHandler,
     model::{
         CallToolRequestMethod, CallToolRequestParams, CallToolResponse, CallToolResult,
-        ContentBlock, Implementation, JsonObject, ListToolsResult, PaginatedRequestParams,
-        ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+        ContentBlock, Implementation, JsonObject, ListToolsResult, MetaObject,
+        PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
     },
     service::{Peer, RequestContext},
 };
@@ -15,12 +15,13 @@ use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use crate::execution::{BashArgs, BashOutput, DEFAULT_TIMEOUT, run_bash};
+use crate::execution::{DEFAULT_TIMEOUT, RunArgs, RunOutput, run_bash};
 
 #[derive(Clone)]
 pub struct LiveClient {
     pub connection_id: String,
     pub peer: Peer<RoleClient>,
+    pub environment: ClientEnvironment,
     pub disconnect: CancellationToken,
 }
 
@@ -39,18 +40,56 @@ pub struct ChannelMcp {
 #[derive(Clone, Default)]
 pub struct ClientMcp;
 
+const CLIENT_ENVIRONMENT_META: &str = "com.ylxdzsw.connector/client-environment";
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ClientEnvironment {
+    pub system: String,
+    pub shell: String,
+}
+
+impl ClientEnvironment {
+    fn current() -> Self {
+        Self {
+            system: std::env::consts::OS.into(),
+            shell: "bash".into(),
+        }
+    }
+}
+
+pub fn client_environment(peer: &Peer<RoleClient>) -> Option<ClientEnvironment> {
+    peer.peer_info()
+        .and_then(|info| {
+            info.meta
+                .as_ref()
+                .and_then(|meta| meta.0.get(CLIENT_ENVIRONMENT_META))
+                .cloned()
+        })
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
-struct GatewayBashArgs {
+struct GatewayRunArgs {
     #[schemars(description = "Connected client name")]
     client: String,
     #[serde(flatten)]
     #[schemars(flatten)]
-    bash: BashArgs,
+    run: RunArgs,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct ClientsOutput {
-    clients: Vec<String>,
+    clients: Vec<ClientSummary>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct ClientSummary {
+    #[schemars(description = "Connected client name")]
+    name: String,
+    #[schemars(description = "Operating system identifier reported by the client")]
+    system: String,
+    #[schemars(description = "Command shell reported by the client")]
+    shell: String,
 }
 
 impl GatewayMcp {
@@ -61,14 +100,22 @@ impl GatewayMcp {
     async fn invoke(&self, request: CallToolRequestParams) -> Result<CallToolResult, McpError> {
         match request.name.as_ref() {
             "clients" => {
-                let mut names: Vec<_> = self.clients.read().await.keys().cloned().collect();
-                names.sort();
-                Ok(CallToolResult::structured(json!(ClientsOutput {
-                    clients: names
-                })))
+                let mut clients: Vec<_> = self
+                    .clients
+                    .read()
+                    .await
+                    .iter()
+                    .map(|(name, client)| ClientSummary {
+                        name: name.clone(),
+                        system: client.environment.system.clone(),
+                        shell: client.environment.shell.clone(),
+                    })
+                    .collect();
+                clients.sort_by(|a, b| a.name.cmp(&b.name));
+                Ok(CallToolResult::structured(json!(ClientsOutput { clients })))
             }
-            "bash" => {
-                let args: GatewayBashArgs = parse_args(request.arguments)?;
+            "run" => {
+                let args: GatewayRunArgs = parse_args(request.arguments)?;
                 let client = self.clients.read().await.get(&args.client).cloned();
                 let Some(client) = client else {
                     return Ok(tool_error(format!(
@@ -76,7 +123,7 @@ impl GatewayMcp {
                         args.client
                     )));
                 };
-                relay_bash(&client.peer, args.bash).await
+                relay_run(&client.peer, args.run).await
             }
             _ => Err(McpError::method_not_found::<CallToolRequestMethod>()),
         }
@@ -91,7 +138,7 @@ impl ChannelMcp {
 
 impl ServerHandler for GatewayMcp {
     fn get_info(&self) -> ServerInfo {
-        server_info("connector-gateway", "Control connected Unix clients")
+        server_info("connector-gateway", "Control connected clients")
     }
 
     async fn list_tools(
@@ -101,14 +148,14 @@ impl ServerHandler for GatewayMcp {
     ) -> Result<ListToolsResult, McpError> {
         Ok(ListToolsResult::with_all_items(vec![
             clients_tool(),
-            gateway_bash_tool(),
+            gateway_run_tool(),
         ]))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
         match name {
             "clients" => Some(clients_tool()),
-            "bash" => Some(gateway_bash_tool()),
+            "run" => Some(gateway_run_tool()),
             _ => None,
         }
     }
@@ -124,7 +171,7 @@ impl ServerHandler for GatewayMcp {
 
 impl ServerHandler for ChannelMcp {
     fn get_info(&self) -> ServerInfo {
-        server_info("connector-channel", "Control one connected Unix client")
+        server_info("connector-channel", "Control one connected client")
     }
 
     async fn list_tools(
@@ -132,11 +179,11 @@ impl ServerHandler for ChannelMcp {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(vec![bash_tool(false)]))
+        Ok(ListToolsResult::with_all_items(vec![run_tool(false)]))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        (name == "bash").then(|| bash_tool(false))
+        (name == "run").then(|| run_tool(false))
     }
 
     async fn call_tool(
@@ -144,20 +191,27 @@ impl ServerHandler for ChannelMcp {
         request: CallToolRequestParams,
         _: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        if request.name != "bash" {
+        if request.name != "run" {
             return Err(McpError::method_not_found::<CallToolRequestMethod>());
         }
-        let args: BashArgs = parse_args(request.arguments)?;
-        relay_bash(&self.peer, args).await.map(Into::into)
+        let args: RunArgs = parse_args(request.arguments)?;
+        relay_run(&self.peer, args).await.map(Into::into)
     }
 }
 
 impl ServerHandler for ClientMcp {
     fn get_info(&self) -> ServerInfo {
-        server_info(
+        let mut info = server_info(
             "connector-client",
-            "Run fresh Bash commands on this Unix client",
-        )
+            "Run fresh commands with Bash on this Linux client",
+        );
+        let mut meta = JsonObject::new();
+        meta.insert(
+            CLIENT_ENVIRONMENT_META.into(),
+            serde_json::to_value(ClientEnvironment::current()).expect("environment serializes"),
+        );
+        info.meta = Some(MetaObject(meta));
+        info
     }
 
     async fn list_tools(
@@ -165,11 +219,11 @@ impl ServerHandler for ClientMcp {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(vec![bash_tool(false)]))
+        Ok(ListToolsResult::with_all_items(vec![run_tool(false)]))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        (name == "bash").then(|| bash_tool(false))
+        (name == "run").then(|| run_tool(false))
     }
 
     async fn call_tool(
@@ -177,10 +231,10 @@ impl ServerHandler for ClientMcp {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        if request.name != "bash" {
+        if request.name != "run" {
             return Err(McpError::method_not_found::<CallToolRequestMethod>());
         }
-        let args: BashArgs = parse_args(request.arguments)?;
+        let args: RunArgs = parse_args(request.arguments)?;
         tracing::info!(
             request_id = ?context.id,
             command = ?args.command,
@@ -197,7 +251,7 @@ impl ServerHandler for ClientMcp {
                     exit_code = output.exit_code,
                     "Bash command completed"
                 );
-                bash_result(output)
+                run_result(output)
             }
             Err(error) => {
                 tracing::warn!(request_id = ?context.id, %error, "Bash command failed");
@@ -208,14 +262,14 @@ impl ServerHandler for ClientMcp {
     }
 }
 
-async fn relay_bash(peer: &Peer<RoleClient>, args: BashArgs) -> Result<CallToolResult, McpError> {
+async fn relay_run(peer: &Peer<RoleClient>, args: RunArgs) -> Result<CallToolResult, McpError> {
     let arguments = serde_json::to_value(args)
         .map_err(|error| McpError::internal_error(error.to_string(), None))?
         .as_object()
         .cloned()
         .unwrap_or_default();
     match peer
-        .call_tool(CallToolRequestParams::new("bash").with_arguments(arguments))
+        .call_tool(CallToolRequestParams::new("run").with_arguments(arguments))
         .await
     {
         Ok(result) => Ok(result),
@@ -228,8 +282,8 @@ fn parse_args<T: DeserializeOwned>(arguments: Option<JsonObject>) -> Result<T, M
         .map_err(|error| McpError::invalid_params(error.to_string(), None))
 }
 
-fn bash_result(output: BashOutput) -> CallToolResult {
-    CallToolResult::structured(serde_json::to_value(output).expect("BashOutput serializes"))
+fn run_result(output: RunOutput) -> CallToolResult {
+    CallToolResult::structured(serde_json::to_value(output).expect("RunOutput serializes"))
 }
 
 fn tool_error(message: impl Into<String>) -> CallToolResult {
@@ -246,7 +300,7 @@ fn clients_tool() -> Tool {
     secure(
         Tool::new(
             "clients",
-            "List clients connected right now",
+            "List connected clients with their system and shell",
             empty_schema(),
         )
         .with_raw_output_schema(schema::<ClientsOutput>())
@@ -260,24 +314,24 @@ fn clients_tool() -> Tool {
     )
 }
 
-fn gateway_bash_tool() -> Tool {
+fn gateway_run_tool() -> Tool {
     secure(
         Tool::new(
-            "bash",
-            "Run one non-persistent Bash command on a connected client",
-            schema::<GatewayBashArgs>(),
+            "run",
+            "Run one non-persistent command using a connected client's shell",
+            schema::<GatewayRunArgs>(),
         )
-        .with_raw_output_schema(schema::<BashOutput>()),
+        .with_raw_output_schema(schema::<RunOutput>()),
     )
 }
 
-fn bash_tool(protected: bool) -> Tool {
+fn run_tool(protected: bool) -> Tool {
     let tool = Tool::new(
-        "bash",
+        "run",
         "Run one non-persistent Bash command and return combined output and exit code",
-        schema::<BashArgs>(),
+        schema::<RunArgs>(),
     )
-    .with_raw_output_schema(schema::<BashOutput>());
+    .with_raw_output_schema(schema::<RunOutput>());
     if protected { secure(tool) } else { tool }
 }
 
@@ -305,4 +359,44 @@ fn empty_schema() -> Arc<JsonObject> {
     Arc::new(
         serde_json::from_value(json!({"type": "object", "additionalProperties": false})).unwrap(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exposes_run_tools_and_client_environment() {
+        let gateway = GatewayMcp::new(Arc::new(RwLock::new(HashMap::new())));
+        assert!(gateway.get_tool("run").is_some());
+        assert!(gateway.get_tool("bash").is_none());
+
+        let client = ClientMcp;
+        assert!(client.get_tool("run").is_some());
+        assert!(client.get_tool("bash").is_none());
+        let info = client.get_info();
+        let environment: ClientEnvironment =
+            serde_json::from_value(info.meta.unwrap().0[CLIENT_ENVIRONMENT_META].clone()).unwrap();
+        assert_eq!(environment, ClientEnvironment::current());
+    }
+
+    #[test]
+    fn client_listing_contains_name_system_and_shell() {
+        let value = serde_json::to_value(ClientsOutput {
+            clients: vec![ClientSummary {
+                name: "build-server".into(),
+                system: "linux".into(),
+                shell: "bash".into(),
+            }],
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            json!({"clients": [{
+                "name": "build-server",
+                "system": "linux",
+                "shell": "bash"
+            }]})
+        );
+    }
 }

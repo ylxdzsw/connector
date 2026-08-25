@@ -46,7 +46,7 @@ use crate::{
     },
     crypto::{connection_code, normalize_code, random_token},
     db::{AuthCodeBinding, Database, OAuthError},
-    mcp::{ChannelMcp, GatewayMcp, LiveClient, LiveClients},
+    mcp::{ChannelMcp, GatewayMcp, LiveClient, LiveClients, client_environment},
 };
 
 #[derive(Clone)]
@@ -236,9 +236,9 @@ async fn authorize(
   <div class="consent-mark">C</div>
   <h1>Allow controller access?</h1>
   <p><strong>{}</strong> is requesting control of Connector as <strong>{}</strong>.</p>
-  <div class="warning">This controller will be able to run Bash commands on all current and future connected clients until access is revoked.</div>
+  <div class="warning">This controller will be able to run shell commands on all current and future connected clients until access is revoked.</div>
   <div class="scope"><span>Discover clients</span><strong>Allowed</strong></div>
-  <div class="scope"><span>Run Bash commands</span><strong>Allowed</strong></div>{}
+  <div class="scope"><span>Run shell commands</span><strong>Allowed</strong></div>{}
   <form method="post" action="/oauth/authorize" class="consent-actions">{}<input type="hidden" name="csrf" value="{}">
     <button class="secondary" name="decision" value="deny">Deny</button>
     <button name="decision" value="allow">Allow access</button>
@@ -739,6 +739,8 @@ async fn establish_client(
         disconnect.clone(),
     ));
     let service = ().serve((outgoing, incoming)).await.context("initialize client MCP")?;
+    let environment =
+        client_environment(service.peer()).context("client did not report its system and shell")?;
     if state
         .db
         .client_for_code(code)
@@ -757,10 +759,11 @@ async fn establish_client(
         LiveClient {
             connection_id: id.clone(),
             peer: service.peer().clone(),
+            environment: environment.clone(),
             disconnect: disconnect.clone(),
         },
     );
-    tracing::info!(client=%name, "client connected");
+    tracing::info!(client=%name, system=%environment.system, shell=%environment.shell, "client connected");
     let socket_task = tokio::spawn(serve_unix_socket(
         listener,
         path,
