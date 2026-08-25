@@ -1,0 +1,30 @@
+[Unit]
+Description=Connector MCP gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=connector
+Group=connector
+ExecStart=/opt/connector/connector-gateway
+EnvironmentFile=/etc/connector.env
+Environment=CONNECTOR_LISTEN=127.0.0.1:3000
+Environment=CONNECTOR_DATABASE=/var/lib/connector/connector.db
+Environment=CONNECTOR_SOCKET_DIR=/run/connector
+Environment=CONNECTOR_CLIENT_BINARY=/opt/connector/connector-client
+StateDirectory=connector
+StateDirectoryMode=0700
+RuntimeDirectory=connector
+RuntimeDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/connector /run/connector
+
+[Install]
+WantedBy=multi-user.target
