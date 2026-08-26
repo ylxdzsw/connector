@@ -83,17 +83,19 @@ The management site can extend a non-revoked credential without changing its
 connection code. Days are added to its current expiration, or from the current
 time when the credential has already expired.
 
-The management site displays one argument-free command:
+After creating a credential, the management site displays one copyable command
+containing its connection code:
 
 ```bash
-curl -fsSL https://connector.ylxdzsw.com/connect | bash
+curl -fsSL https://connector.ylxdzsw.com/connect | bash -s -- '<connection-code>'
 ```
 
 The script uses an executable `connector-client` already available in `PATH`,
-or otherwise downloads a temporary copy and runs it. The binary prompts for
-the connection code and reads it from `/dev/tty`, which remains interactive
-even though standard input contains the piped script. The name and code never
-need to be quoted or placed in the command line.
+or otherwise downloads a temporary copy and runs it. The script passes the
+connection code to the binary as `--code`. The code is a reusable bearer
+credential and the displayed command must be treated as secret. For manual use
+without a command argument, the binary still prompts for the code and reads it
+from `/dev/tty` without echo.
 
 The distributed Linux client is built against musl as a fully static
 executable. It has no glibc or shared-library dependency, although a separate

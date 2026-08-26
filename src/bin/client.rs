@@ -25,6 +25,8 @@ use tracing_subscriber::EnvFilter;
 struct Args {
     #[arg(long, default_value = "https://connector.ylxdzsw.com")]
     gateway: String,
+    #[arg(long, value_name = "CONNECTION_CODE")]
+    code: Option<String>,
 }
 
 #[tokio::main]
@@ -39,7 +41,10 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
-    let code = tokio::task::spawn_blocking(read_code).await??;
+    let code = match args.code {
+        Some(code) => validate_code(&code)?,
+        None => tokio::task::spawn_blocking(read_code).await??,
+    };
     let endpoint = websocket_endpoint(&args.gateway)?;
     let mut delay = 1;
     loop {
@@ -77,7 +82,11 @@ fn read_code() -> Result<String> {
     reader.read_line(&mut code)?;
     drop(echo);
     reader.get_mut().write_all(b"\n")?;
-    let code = normalize_code(&code);
+    validate_code(&code)
+}
+
+fn validate_code(value: &str) -> Result<String> {
+    let code = normalize_code(value);
     if code.len() != 8 {
         bail!("connection code must contain 8 characters");
     }
@@ -190,5 +199,11 @@ mod tests {
             websocket_endpoint("http://127.0.0.1:3000").unwrap(),
             "ws://127.0.0.1:3000/link"
         );
+    }
+
+    #[test]
+    fn validates_supplied_connection_codes() {
+        assert_eq!(validate_code("oil23456").unwrap(), "01123456");
+        assert!(validate_code("short").is_err());
     }
 }

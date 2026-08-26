@@ -639,9 +639,20 @@ async fn render_management(
     let grants = state.db.list_grants().await.unwrap_or_default();
     let online: HashSet<_> = state.clients.read().await.keys().cloned().collect();
     let (csrf, set_cookie) = csrf_for(headers);
-    let notice = created.map(|(name, code)| format!(
-        "<div class=\"notice\"><strong>Client {} created</strong>Connection code: <code>{}</code>. This is the only time the code is shown.</div>", escape(name), escape(code)
-    )).unwrap_or_default();
+    let notice = created
+        .map(|(name, code)| {
+            let command = format!(
+                "curl -fsSL {}/connect | bash -s -- {}",
+                PUBLIC_URL,
+                shell_quote(code)
+            );
+            format!(
+                "<div class=\"notice\"><strong>Client {} created</strong>Copy and run this command on the client host: <code>{}</code><br><small>This command contains the reusable connection credential and is shown only once.</small></div>",
+                escape(name),
+                escape(&command)
+            )
+        })
+        .unwrap_or_default();
     let client_rows: String = if clients.is_empty() {
         "<tr><td colspan=\"4\" class=\"empty\">No client credentials yet.</td></tr>".into()
     } else {
@@ -666,7 +677,7 @@ async fn render_management(
         r#"
 <header class="topbar"><div class="topbar-inner"><div class="brand"><span class="mark">C</span>Connector</div><span class="subject">{}</span></div></header>
 <main>{}<div class="page-head"><div><h1>Connection control</h1><p>Provision Unix clients and manage controller access.</p></div><span class="status"><span class="dot online"></span>{} client{} online</span></div>
-<section><div class="section-head"><h2>Connect a client</h2></div><div class="panel"><div class="command"><code>curl -fsSL {}/connect | bash</code></div><form class="create" method="post" action="/clients"><input type="hidden" name="csrf" value="{}"><label>Client name<input required maxlength="64" name="name" placeholder="build-server" pattern="[A-Za-z0-9][A-Za-z0-9._-]*"></label><label>Valid for<input required type="number" min="1" max="3650" value="30" name="days"></label><button>Create credential</button></form></div></section>
+<section><div class="section-head"><h2>Connect a client</h2></div><div class="panel"><div class="command"><code>Create a credential to get a copyable connection command.</code></div><form class="create" method="post" action="/clients"><input type="hidden" name="csrf" value="{}"><label>Client name<input required maxlength="64" name="name" placeholder="build-server" pattern="[A-Za-z0-9][A-Za-z0-9._-]*"></label><label>Valid for<input required type="number" min="1" max="3650" value="30" name="days"></label><button>Create credential</button></form></div></section>
 <section class="section"><div class="section-head"><h2>Clients</h2></div><div class="panel table-wrap"><table><thead><tr><th>Name</th><th>Status</th><th>Expires</th><th></th></tr></thead><tbody>{}</tbody></table></div></section>
 <section class="section"><div class="section-head"><h2>Controller grants</h2></div><div class="panel table-wrap"><table><thead><tr><th>Controller</th><th>Scopes</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody>{}</tbody></table></div></section>
 </main>"#,
@@ -674,7 +685,6 @@ async fn render_management(
         notice,
         online_count,
         if online_count == 1 { "" } else { "s" },
-        escape(PUBLIC_URL),
         escape(&csrf),
         client_rows,
         grant_rows
@@ -891,6 +901,10 @@ fn connect_script_body(base: &str) -> String {
     format!(
         r#"#!/bin/sh
 set -eu
+if [ "$#" -ne 1 ]; then
+    echo 'usage: curl -fsSL {base}/connect | bash -s -- CONNECTION_CODE' >&2
+    exit 2
+fi
 client="$(command -v connector-client 2>/dev/null || true)"
 if [ -z "$client" ] || [ ! -x "$client" ]; then
     client="$(mktemp "${{TMPDIR:-/tmp}}/connector-client.XXXXXX")"
@@ -898,9 +912,13 @@ if [ -z "$client" ] || [ ! -x "$client" ]; then
     curl -fsSL '{base}/download/client' -o "$client"
     chmod 700 "$client"
 fi
-"$client" --gateway '{base}'
+"$client" --gateway '{base}' --code "$1"
 "#
     )
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 async fn download_client() -> Response {
@@ -1124,8 +1142,19 @@ mod tests {
     fn connect_script_checks_for_an_installed_client_before_downloading() {
         let script = connect_script_body("https://connector.example.com");
         let check = script.find("command -v connector-client").unwrap();
-        let download = script.find("curl -fsSL").unwrap();
+        let download = script
+            .find("curl -fsSL 'https://connector.example.com/download/client'")
+            .unwrap();
         assert!(check < download);
-        assert!(script.contains("\"$client\" --gateway 'https://connector.example.com'"));
+        assert!(
+            script.contains("\"$client\" --gateway 'https://connector.example.com' --code \"$1\"")
+        );
+        assert!(script.contains("if [ \"$#\" -ne 1 ]"));
+    }
+
+    #[test]
+    fn shell_quotes_connection_command_values() {
+        assert_eq!(shell_quote("ABC123"), "'ABC123'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
     }
 }

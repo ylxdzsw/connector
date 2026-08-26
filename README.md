@@ -57,16 +57,18 @@ trusted subject header. Public OAuth, MCP, link, script, and discovery routes
 must have any inbound copy removed. See [deploy/nginx.conf](deploy/nginx.conf).
 
 The management page creates an eight-character connection code. On a client,
-run the command shown there:
+copy and run the complete command shown after creating the credential:
 
 ```bash
-curl -fsSL https://connector.ylxdzsw.com/connect | bash
+curl -fsSL https://connector.ylxdzsw.com/connect | bash -s -- 'CONNECTION_CODE'
 ```
 
-The client binary reads the code without echo from `/dev/tty`, then remains in
-the foreground and reconnects after transient network failures. If an
-executable `connector-client` is already in `PATH`, the script runs it instead
-of downloading another copy.
+The command contains the reusable client connection credential, so treat it as
+secret. The client remains in the foreground and reconnects after transient
+network failures. If an executable `connector-client` is already in `PATH`, the
+script runs it instead of downloading another copy. For manual use without a
+command argument, `connector-client` still reads the code without echo from
+`/dev/tty`.
 
 The management page can extend a non-revoked client credential without changing
 its connection code. The client logs each Bash command, working directory,
