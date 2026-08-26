@@ -1,11 +1,33 @@
 # Connector
 
-Connector lets an OAuth-authorized MCP controller run fresh shell commands and
-capture best-effort desktop screenshots on Unix clients behind NAT. Clients
-establish outbound WebSocket links; the gateway exposes Streamable HTTP MCP and
-one local Unix socket per live client.
+Connector lets an OAuth-authorized MCP controller operate Unix machines that
+are behind NAT. Each machine opens an outbound WebSocket to a central gateway;
+the controller can then discover connected machines, run fresh Bash commands,
+apply structured file patches, and capture best-effort desktop screenshots.
 
-## Build
+Connector is made of two Rust binaries:
+
+- `connector-gateway` serves OAuth, Streamable HTTP MCP, the management UI,
+  WebSocket links, and local Unix-socket channels.
+- `connector-client` runs on each controlled machine and reconnects to the
+  gateway without requiring an inbound port.
+
+```text
+Controller -- MCP/HTTPS --> Nginx -- Unix socket --> Gateway
+                                                   |
+                                                   +-- MCP/WebSocket --> Client -- bash -lc
+                                                   +-- MCP over local Unix sockets
+```
+
+## Typical Usage
+
+### 1. Build and deploy the gateway
+
+The checked-in configuration targets `https://connector.ylxdzsw.com` and the
+paths listed in [`src/config.rs`](src/config.rs). A different deployment must
+change those constants and the matching Nginx configuration.
+
+Build the gateway and the fully static x86-64 Linux client:
 
 ```bash
 rustup target add x86_64-unknown-linux-musl
@@ -17,102 +39,149 @@ The build produces:
 - `target/release/connector-gateway`
 - `target/x86_64-unknown-linux-musl/release/connector-client`
 
-The client is a fully static musl executable, so it does not depend on the
-target host's glibc version or shared libraries. It still targets x86-64 Linux;
-set `CONNECTOR_CLIENT_TARGET` to another installed musl target when building
-for a different architecture, then install the resulting client as
-`/opt/connector/connector-client` for `/connect` to serve.
+Install the binaries and use the checked-in systemd and Nginx files as the
+deployment templates:
 
-## Configure
+- [`deploy/connector.service`](deploy/connector.service)
+- [`deploy/connector.ylxdzsw.com.conf`](deploy/connector.ylxdzsw.com.conf)
+- [`deploy/connector-proxy-headers.conf`](deploy/connector-proxy-headers.conf)
 
-The deployment identity and paths are fixed in `src/config.rs`:
+The gateway requires `CONNECTOR_OAUTH_CLIENT_SECRET`. `RUST_LOG` is optional.
+It listens only on `/run/connector/.gateway.sock`; Nginx terminates TLS, applies
+the existing browser cookie gate to management and authorization routes, and
+proxies public MCP, OAuth, download, and client-link routes.
 
-| Setting | Value |
-| --- | --- |
-| Public URL | `https://connector.ylxdzsw.com` |
-| Gateway socket | `/run/connector/.gateway.sock` |
-| SQLite database | `/var/lib/connector/connector.db` |
-| Channel directory | `/run/connector` |
-| Served client | `/opt/connector/connector-client` |
-| Trusted subject header | `x-connector-subject` |
-| OAuth client ID | `chatgpt` |
-| OAuth redirect URI | `https://chatgpt.com/connector_platform_oauth_redirect` |
+### 2. Connect a Unix machine
 
-Only `CONNECTOR_OAUTH_CLIENT_SECRET` is required at runtime. `RUST_LOG` may be
-set to adjust logging. The gateway always trusts the first `X-Forwarded-For`
-address because its HTTP listener is accessible only to the local Nginx worker
-through the protected Unix socket.
-
-## Run
-
-```bash
-CONNECTOR_OAUTH_CLIENT_SECRET='generate-a-long-random-secret' \
-target/release/connector-gateway
-```
-
-Put the private Unix socket behind TLS and an existing browser authentication
-gate. The socket is mode `0660`; its directory must be searchable by the Nginx
-worker group. Only management routes and `/oauth/authorize` may receive the
-trusted subject header. Public OAuth, MCP, link, script, and discovery routes
-must have any inbound copy removed. See [deploy/nginx.conf](deploy/nginx.conf).
-
-The management page creates an eight-character connection code. On a client,
-copy and run the complete command shown after creating the credential:
+Open the management site, create a named client credential, and run the command
+shown by the site on that machine:
 
 ```bash
 curl -fsSL https://connector.ylxdzsw.com/connect | bash -s -- 'CONNECTION_CODE'
 ```
 
-The command contains the reusable client connection credential, so treat it as
-secret. The client remains in the foreground and reconnects after transient
-network failures. If an executable `connector-client` is already in `PATH`, the
-script runs it instead of downloading another copy. For manual use without a
-command argument, `connector-client` still reads the code without echo from
-`/dev/tty`.
+The command uses `connector-client` from `PATH` or temporarily downloads the
+static client. The client stays in the foreground and reconnects after
+transient network failures. Running `connector-client` without `--code` reads
+the code from `/dev/tty` without echo.
 
-The management page can extend a non-revoked client credential without changing
-its connection code, or rotate the code to invalidate the previous command. A
-rotation disconnects the current client link; run the newly displayed command
-to reconnect it. Rotation can also restore a revoked credential, but does not
-extend an expired credential. The client logs each Bash command, working
-directory, timeout, and full standard input before execution. After execution it
-logs the combined standard output and error plus the exit code. Operators must
-protect these process logs because they can contain sensitive data.
+The complete command contains a reusable bearer credential. Do not put it in
+shell history, logs, source control, or process supervision configuration.
+Rotating or revoking the credential disconnects the current link.
 
-The client also offers best-effort full-desktop screenshots by invoking common
-capture software from its `PATH`. On Wayland it tries desktop-native tools and
-`grim`; on X11 it also tries `maim`, `scrot`, and ImageMagick. No capture
-software is bundled into the static client. The tool returns unavailable on a
-headless or unsupported client. Screenshot bytes are not persisted or logged,
-but controllers can receive everything visible in the user's graphical
-session.
+### 3. Connect an MCP controller
 
-## MCP
+Configure the controller with this Streamable HTTP MCP endpoint:
 
-Controllers connect to `https://connector.ylxdzsw.com/mcp` and receive four
-tools:
+```text
+https://connector.ylxdzsw.com/mcp
+```
 
-- `clients()` returns current online clients as
-  `{ "clients": [{ "name": string, "system": string, "shell": string }] }`.
-- `run(client, command, cwd?, timeout?, stdin?)` invokes the selected client's
-  shell once and returns `{ "output": string, "exit_code": number }`.
-- `apply_patch(client, patch, cwd?)` applies one Mu/Codex-style patch envelope
-  after preflighting all file changes and returns `{ "output": string }` with
-  the changed paths. Relative paths resolve from `cwd` or the client process's
-  current directory.
-- `screenshot(client)` returns the selected client's full graphical desktop as
-  an MCP PNG or JPEG image, or a tool error when capture is unavailable.
+The controller follows the gateway's OAuth discovery metadata, opens the
+browser consent flow, and receives the `control` scope. An approved controller
+can use all clients that are online now or connect while the grant is valid.
 
-While a client is online, `/run/connector/<name>.sock` exposes that client's
-`run(command, cwd?, timeout?, stdin?)`, `apply_patch(patch, cwd?)`, and
-`screenshot()` tools as newline-delimited MCP JSON-RPC.
-Channel sockets are mode `0600`. The shared runtime directory is mode `0710`:
-the Nginx worker group can traverse it to the mode-`0660` `.gateway.sock`, but
-cannot list the directory or access channel sockets.
+The gateway exposes:
 
-## Test
+| Tool | Purpose |
+| --- | --- |
+| `clients()` | List connected clients and their system and shell metadata. |
+| `run(client, command, cwd?, timeout?, stdin?)` | Run one fresh Bash process and return combined output and its exit code. |
+| `apply_patch(client, patch, cwd?)` | Apply one Mu/Codex-style structured patch after complete preflight. |
+| `screenshot(client)` | Return a PNG or JPEG of the client's full desktop when a supported capture backend is available. |
+
+Each online client also has a mode-`0600` local channel at
+`/run/connector/<name>.sock`. It exposes `run`, `apply_patch`, and `screenshot`
+as newline-delimited MCP JSON-RPC without OAuth; filesystem permissions are the
+authorization boundary for this local interface.
+
+## Key Designs
+
+### MCP end to end
+
+Connector terminates two MCP sessions rather than translating MCP into a
+private command protocol. The external controller is an MCP client of the
+gateway. On the outbound WebSocket link, the gateway is an MCP client of the
+Unix client. The gateway maps calls, results, errors, cancellation, and image
+content between those sessions.
+
+### Separate credential domains
+
+Three credentials have deliberately separate roles:
+
+| Credential | Accepted by | Authority |
+| --- | --- | --- |
+| Nginx authentication cookie | Management and OAuth authorization routes | Manage clients and approve grants |
+| OAuth access token | `/mcp` | Control every connected client |
+| Client connection code | `/link` | Authenticate one named client link |
+
+No credential is accepted in another role. OAuth grants are global rather than
+per-client, so approval grants the controller the Unix-user privileges of all
+current and future connected clients until expiry or revocation.
+
+### Outbound links and ephemeral channels
+
+Clients initiate authenticated WebSocket connections, which avoids inbound
+network access through NAT. WebSocket Ping/Pong supplies transport liveness,
+and only one live link is allowed for each client record. Live links, online
+status, channel sockets, and in-flight request mappings exist only in memory;
+disconnects and gateway restarts fail in-flight work instead of replaying it.
+
+### Fresh command processes
+
+Every `run` call starts a new `bash -lc` process with an optional working
+directory, literal standard input, and timeout. Shell state does not carry
+between calls. A nonzero exit status is a normal tool result; startup,
+availability, timeout, and transport failures are tool errors.
+
+The client traces complete commands, input, output, and patches. A service
+supervisor may persist those logs, so operators must treat them as sensitive.
+
+### Preflighted structured patches
+
+`apply_patch` supports add, update, move, and delete operations in one
+`*** Begin Patch` / `*** End Patch` envelope. The client parses and preflights
+the entire envelope before publishing any change, rejects conflicting targets,
+and preserves existing-file inodes, permissions, hard links, and symlink target
+relationships where applicable.
+
+Publication is recoverable but is not a cross-file transaction. If a later
+commit fails, the tool reports which earlier changes completed. See
+[`DESIGN.md`](DESIGN.md) for the exact filesystem semantics.
+
+### Bounded screenshot capture
+
+Screenshots use common Wayland or X11 capture tools already present on the
+client. Capture is serialized, time-bounded, validated as PNG or JPEG, and
+limited to 8 MiB. Connector does not store image bytes, but a successful call
+can expose everything visible in the user's graphical session.
+
+### Persistent credentials, transient workloads
+
+SQLite stores client credentials, OAuth clients and grants, authorization code
+hashes, and token hashes and lifecycle state. Connector does not persist
+commands, command output, patch contents, screenshots, live links, or MCP
+request mappings.
+
+## Development
+
+Use the checked-in `Cargo.lock` and run the same checks as CI:
 
 ```bash
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo check --all-targets --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
 ```
+
+Release builds use [`scripts/build-release.sh`](scripts/build-release.sh). The
+client target defaults to `x86_64-unknown-linux-musl`; set
+`CONNECTOR_CLIENT_TARGET` to another installed musl target for a different CPU
+architecture.
+
+For protocol details, trust boundaries, OAuth flows, patch behavior, and design
+rationale, read [`DESIGN.md`](DESIGN.md).
+
+## License
+
+Connector is licensed under the MIT License.
