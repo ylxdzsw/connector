@@ -198,9 +198,9 @@ The gateway validates the OAuth client, exact redirect URI, scope, resource,
 and PKCE method. It then asks the user to approve this grant:
 
 ```text
-Allow this controller to run shell commands and capture graphical desktop
-screenshots on all current and future connected clients until access is
-revoked?
+Allow this controller to run shell commands, apply structured file patches, and
+capture graphical desktop screenshots on all current and future connected
+clients until access is revoked?
 ```
 
 The consent POST uses CSRF protection. Consent is recorded for the authenticated
@@ -261,11 +261,12 @@ revocation closes that client's link. The two operations are independent.
 The gateway exposes standard MCP Streamable HTTP at `/mcp`. It is the MCP
 server; the controller is the MCP client.
 
-The gateway exposes three tools:
+The gateway exposes four tools:
 
 ```text
 clients()
 run(client, command, cwd?, timeout?, stdin?)
+apply_patch(client, patch, cwd?)
 screenshot(client)
 ```
 
@@ -281,6 +282,11 @@ before a later `run` call.
 `run` selects a client by name and relays one non-persistent command to that
 client's advertised shell. An unknown or disconnected client produces a
 tool-level availability error.
+
+`apply_patch` selects a client by name and relays one Mu/Codex-style structured
+patch. The client preflights all add, update, move, and delete operations before
+publishing changes. Relative paths resolve from the requested working directory
+or the client process's current directory.
 
 `screenshot` asks a client to capture its full graphical desktop and returns a
 standard MCP PNG or JPEG image. The tool is always present; a headless client,
@@ -299,17 +305,19 @@ text frame contains one complete UTF-8 MCP message. The client credential is
 authenticated during upgrade, and WebSocket Ping/Pong provides liveness. No
 private heartbeat or authentication messages are mixed into MCP.
 
-The client exposes two tools:
+The client exposes three tools:
 
 ```text
 run(command, cwd?, timeout?, stdin?)
+apply_patch(patch, cwd?)
 screenshot()
 ```
 
 The client reports its system and shell in standard MCP initialization
 metadata. The gateway terminates the external and internal MCP sessions. It
-handles `clients` itself and maps external `run` calls to the selected client's
-`run` tool. It also relays `screenshot` calls and their MCP image content.
+handles `clients` itself and maps external `run` and `apply_patch` calls to the
+selected client's corresponding tools. It also relays `screenshot` calls and
+their MCP image content.
 Request IDs, results, errors, and cancellation are mapped through both
 sessions. A client that omits its environment metadata or provides malformed
 values is rejected during link initialization.
@@ -322,8 +330,9 @@ While a client is connected, the gateway listens on:
 /run/connector/<name>.sock
 ```
 
-The socket exposes that client's `run(command, cwd?, timeout?, stdin?)` and
-`screenshot()` tools using newline-delimited MCP JSON-RPC.
+The socket exposes that client's `run(command, cwd?, timeout?, stdin?)`,
+`apply_patch(patch, cwd?)`, and `screenshot()` tools using newline-delimited MCP
+JSON-RPC.
 Channel sockets are mode `0600`. The runtime directory is mode `0710`, allowing
 the Nginx worker group to traverse to the mode-`0660` HTTP gateway socket
 without listing the directory or accessing channels. The gateway removes a
@@ -347,6 +356,25 @@ The result contains combined command output and the exit code. A nonzero exit
 code is a normal tool result. MCP errors are reserved for invocation failures.
 Mu's `title` and `risk` fields are omitted because they are controller UI and
 policy metadata rather than execution inputs.
+
+## Structured Patches
+
+Each `apply_patch` call accepts one `*** Begin Patch` / `*** End Patch`
+envelope using Mu/Codex add, update, move, and delete operations. The client
+parses and preflights the complete envelope before changing the filesystem. It
+rejects conflicting targets and existing add or move destinations, and combines
+repeated non-moving updates to one path into one final write.
+
+Relative paths resolve from `cwd`, or from the client process's current
+directory when `cwd` is omitted. Absolute paths are used as written. Updating
+through a symlink edits its regular-file target; moving or deleting a symlink
+acts on the link. Existing-file updates preserve the inode, permissions, hard
+links, and symlink target relationship, use an advisory lock, and keep a
+recoverable sibling backup while writing.
+
+The client logs the full patch, working directory, result summary, and failures
+to standard error. Patch content and paths may therefore be persisted by the
+service supervisor and must be treated as sensitive.
 
 ## Screenshot Capture
 

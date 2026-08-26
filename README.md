@@ -89,19 +89,23 @@ session.
 
 ## MCP
 
-Controllers connect to `https://connector.ylxdzsw.com/mcp` and receive three
+Controllers connect to `https://connector.ylxdzsw.com/mcp` and receive four
 tools:
 
 - `clients()` returns current online clients as
   `{ "clients": [{ "name": string, "system": string, "shell": string }] }`.
 - `run(client, command, cwd?, timeout?, stdin?)` invokes the selected client's
   shell once and returns `{ "output": string, "exit_code": number }`.
+- `apply_patch(client, patch, cwd?)` applies one Mu/Codex-style patch envelope
+  after preflighting all file changes and returns `{ "output": string }` with
+  the changed paths. Relative paths resolve from `cwd` or the client process's
+  current directory.
 - `screenshot(client)` returns the selected client's full graphical desktop as
   an MCP PNG or JPEG image, or a tool error when capture is unavailable.
 
 While a client is online, `/run/connector/<name>.sock` exposes that client's
-`run(command, cwd?, timeout?, stdin?)` and `screenshot()` tools as
-newline-delimited MCP JSON-RPC.
+`run(command, cwd?, timeout?, stdin?)`, `apply_patch(patch, cwd?)`, and
+`screenshot()` tools as newline-delimited MCP JSON-RPC.
 Channel sockets are mode `0600`. The shared runtime directory is mode `0710`:
 the Nginx worker group can traverse it to the mode-`0660` `.gateway.sock`, but
 cannot list the directory or access channel sockets.

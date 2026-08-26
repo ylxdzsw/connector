@@ -237,9 +237,9 @@ async fn authorize(
   <div class="consent-mark">C</div>
   <h1>Allow controller access?</h1>
   <p><strong>{}</strong> is requesting control of Connector as <strong>{}</strong>.</p>
-  <div class="warning">This controller will be able to run shell commands and capture graphical desktop screenshots on all current and future connected clients until access is revoked.</div>
+  <div class="warning">This controller will be able to run shell commands, apply structured file patches, and capture graphical desktop screenshots on all current and future connected clients until access is revoked.</div>
   <div class="scope"><span>Discover clients</span><strong>Allowed</strong></div>
-  <div class="scope"><span>Run commands and capture screenshots</span><strong>Allowed</strong></div>{}
+  <div class="scope"><span>Run commands, apply patches, and capture screenshots</span><strong>Allowed</strong></div>{}
   <form method="post" action="/oauth/authorize" class="consent-actions">{}<input type="hidden" name="csrf" value="{}">
     <button class="secondary" name="decision" value="deny">Deny</button>
     <button name="decision" value="allow">Allow access</button>

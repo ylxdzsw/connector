@@ -1,3 +1,4 @@
+pub mod apply_patch;
 pub mod config;
 pub mod crypto;
 pub mod db;

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rmcp::{
@@ -17,6 +17,7 @@ use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    apply_patch::{ApplyPatchArgs, ApplyPatchOutput, apply_patch},
     execution::{DEFAULT_TIMEOUT, RunArgs, RunOutput, run_bash},
     screenshot,
 };
@@ -93,6 +94,17 @@ struct GatewayRunArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct GatewayApplyPatchArgs {
+    #[schemars(description = "Connected client name")]
+    client: String,
+    #[schemars(description = "Mu/Codex-style patch envelope to apply")]
+    patch: String,
+    #[schemars(description = "Base directory for relative patch paths")]
+    cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GatewayScreenshotArgs {
     #[schemars(description = "Connected client name")]
     client: String,
@@ -150,6 +162,24 @@ impl GatewayMcp {
                 };
                 relay_run(&client.peer, args.run).await
             }
+            "apply_patch" => {
+                let args: GatewayApplyPatchArgs = parse_args(request.arguments)?;
+                let client = self.clients.read().await.get(&args.client).cloned();
+                let Some(client) = client else {
+                    return Ok(tool_error(format!(
+                        "client '{}' is not connected",
+                        args.client
+                    )));
+                };
+                relay_apply_patch(
+                    &client.peer,
+                    ApplyPatchArgs {
+                        patch: args.patch,
+                        cwd: args.cwd,
+                    },
+                )
+                .await
+            }
             "screenshot" => {
                 let args: GatewayScreenshotArgs = parse_args(request.arguments)?;
                 let client = self.clients.read().await.get(&args.client).cloned();
@@ -185,6 +215,7 @@ impl ServerHandler for GatewayMcp {
         Ok(ListToolsResult::with_all_items(vec![
             clients_tool(),
             gateway_run_tool(),
+            gateway_apply_patch_tool(),
             gateway_screenshot_tool(),
         ]))
     }
@@ -193,6 +224,7 @@ impl ServerHandler for GatewayMcp {
         match name {
             "clients" => Some(clients_tool()),
             "run" => Some(gateway_run_tool()),
+            "apply_patch" => Some(gateway_apply_patch_tool()),
             "screenshot" => Some(gateway_screenshot_tool()),
             _ => None,
         }
@@ -219,6 +251,7 @@ impl ServerHandler for ChannelMcp {
     ) -> Result<ListToolsResult, McpError> {
         Ok(ListToolsResult::with_all_items(vec![
             run_tool(false),
+            apply_patch_tool(false),
             screenshot_tool(false),
         ]))
     }
@@ -226,6 +259,7 @@ impl ServerHandler for ChannelMcp {
     fn get_tool(&self, name: &str) -> Option<Tool> {
         match name {
             "run" => Some(run_tool(false)),
+            "apply_patch" => Some(apply_patch_tool(false)),
             "screenshot" => Some(screenshot_tool(false)),
             _ => None,
         }
@@ -240,6 +274,10 @@ impl ServerHandler for ChannelMcp {
             "run" => {
                 let args: RunArgs = parse_args(request.arguments)?;
                 relay_run(&self.peer, args).await.map(Into::into)
+            }
+            "apply_patch" => {
+                let args: ApplyPatchArgs = parse_args(request.arguments)?;
+                relay_apply_patch(&self.peer, args).await.map(Into::into)
             }
             "screenshot" => {
                 let _: ScreenshotArgs = parse_args(request.arguments)?;
@@ -272,6 +310,7 @@ impl ServerHandler for ClientMcp {
     ) -> Result<ListToolsResult, McpError> {
         Ok(ListToolsResult::with_all_items(vec![
             run_tool(false),
+            apply_patch_tool(false),
             screenshot_tool(false),
         ]))
     }
@@ -279,6 +318,7 @@ impl ServerHandler for ClientMcp {
     fn get_tool(&self, name: &str) -> Option<Tool> {
         match name {
             "run" => Some(run_tool(false)),
+            "apply_patch" => Some(apply_patch_tool(false)),
             "screenshot" => Some(screenshot_tool(false)),
             _ => None,
         }
@@ -312,6 +352,34 @@ impl ServerHandler for ClientMcp {
                 Err(error) => {
                     tracing::warn!(request_id = ?context.id, %error, "screenshot failed");
                     tool_error(error)
+                }
+            };
+            return Ok(result.into());
+        }
+        if request.name == "apply_patch" {
+            let args: ApplyPatchArgs = parse_args(request.arguments)?;
+            tracing::info!(
+                request_id = ?context.id,
+                patch = ?args.patch,
+                cwd = ?args.cwd,
+                "applying patch"
+            );
+            let result = match tokio::task::spawn_blocking(move || apply_patch(args)).await {
+                Ok(Ok(output)) => {
+                    tracing::info!(
+                        request_id = ?context.id,
+                        output = ?output.output,
+                        "patch applied"
+                    );
+                    apply_patch_result(output)
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(request_id = ?context.id, %error, "patch failed");
+                    tool_error(format!("{error:#}"))
+                }
+                Err(error) => {
+                    tracing::warn!(request_id = ?context.id, %error, "patch task failed");
+                    tool_error(format!("patch task failed: {error}"))
                 }
             };
             return Ok(result.into());
@@ -362,6 +430,24 @@ async fn relay_run(peer: &Peer<RoleClient>, args: RunArgs) -> Result<CallToolRes
     }
 }
 
+async fn relay_apply_patch(
+    peer: &Peer<RoleClient>,
+    args: ApplyPatchArgs,
+) -> Result<CallToolResult, McpError> {
+    let arguments = serde_json::to_value(args)
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    match peer
+        .call_tool(CallToolRequestParams::new("apply_patch").with_arguments(arguments))
+        .await
+    {
+        Ok(result) => Ok(result),
+        Err(error) => Ok(tool_error(format!("client became unavailable: {error}"))),
+    }
+}
+
 async fn relay_screenshot(peer: &Peer<RoleClient>) -> Result<CallToolResult, McpError> {
     match peer
         .call_tool(CallToolRequestParams::new("screenshot"))
@@ -379,6 +465,10 @@ fn parse_args<T: DeserializeOwned>(arguments: Option<JsonObject>) -> Result<T, M
 
 fn run_result(output: RunOutput) -> CallToolResult {
     CallToolResult::structured(serde_json::to_value(output).expect("RunOutput serializes"))
+}
+
+fn apply_patch_result(output: ApplyPatchOutput) -> CallToolResult {
+    CallToolResult::structured(serde_json::to_value(output).expect("ApplyPatchOutput serializes"))
 }
 
 fn tool_error(message: impl Into<String>) -> CallToolResult {
@@ -420,6 +510,18 @@ fn gateway_run_tool() -> Tool {
     )
 }
 
+fn gateway_apply_patch_tool() -> Tool {
+    secure(
+        Tool::new(
+            "apply_patch",
+            "Apply one structured patch to files on a connected client",
+            schema::<GatewayApplyPatchArgs>(),
+        )
+        .with_raw_output_schema(schema::<ApplyPatchOutput>())
+        .with_annotations(apply_patch_annotations()),
+    )
+}
+
 fn gateway_screenshot_tool() -> Tool {
     secure(
         Tool::new(
@@ -441,6 +543,17 @@ fn run_tool(protected: bool) -> Tool {
     if protected { secure(tool) } else { tool }
 }
 
+fn apply_patch_tool(protected: bool) -> Tool {
+    let tool = Tool::new(
+        "apply_patch",
+        "Apply one Mu/Codex-style patch envelope after preflighting all file changes",
+        schema::<ApplyPatchArgs>(),
+    )
+    .with_raw_output_schema(schema::<ApplyPatchOutput>())
+    .with_annotations(apply_patch_annotations());
+    if protected { secure(tool) } else { tool }
+}
+
 fn screenshot_tool(protected: bool) -> Tool {
     let tool = Tool::new(
         "screenshot",
@@ -456,6 +569,14 @@ fn screenshot_annotations() -> ToolAnnotations {
         .read_only(true)
         .destructive(false)
         .idempotent(true)
+        .open_world(false)
+}
+
+fn apply_patch_annotations() -> ToolAnnotations {
+    ToolAnnotations::new()
+        .read_only(false)
+        .destructive(true)
+        .idempotent(false)
         .open_world(false)
 }
 
@@ -493,12 +614,14 @@ mod tests {
     fn exposes_run_tools_and_client_environment() {
         let gateway = GatewayMcp::new(Arc::new(RwLock::new(HashMap::new())));
         assert!(gateway.get_tool("run").is_some());
+        assert!(gateway.get_tool("apply_patch").is_some());
         assert!(gateway.get_tool("bash").is_none());
 
         assert!(gateway.get_tool("screenshot").is_some());
 
         let client = ClientMcp::default();
         assert!(client.get_tool("run").is_some());
+        assert!(client.get_tool("apply_patch").is_some());
         assert!(client.get_tool("screenshot").is_some());
         assert!(client.get_tool("bash").is_none());
         let info = client.get_info();
