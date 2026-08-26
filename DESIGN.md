@@ -83,10 +83,11 @@ The management site can extend a non-revoked credential without changing its
 connection code. Days are added to its current expiration, or from the current
 time when the credential has already expired.
 
-It can also rotate a non-revoked client code. Rotation replaces the stored code,
-invalidates the previous code, disconnects the live link if present, and shows
-the new copyable connection command. The client must run that command to
-reconnect.
+It can also rotate a client code. Rotation replaces the stored code, invalidates
+the previous code, disconnects the live link if present, and shows the new
+copyable connection command. Rotation of a revoked client also clears its
+revocation state; it does not extend an expired client credential. The client
+must run the new command to reconnect.
 
 After creating a credential, the management site displays one copyable command
 containing its connection code:

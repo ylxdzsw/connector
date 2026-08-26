@@ -202,7 +202,7 @@ impl Database {
     pub async fn rotate_client_code(&self, name: &str, code: &str) -> Result<bool> {
         let connection = self.0.lock().await;
         Ok(connection.execute(
-            "UPDATE clients SET code=?2 WHERE name=?1 AND revoked_at IS NULL",
+            "UPDATE clients SET code=?2, revoked_at=NULL WHERE name=?1",
             params![name, code],
         )? == 1)
     }
@@ -578,7 +578,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotates_active_client_code_and_sorts_revoked_clients_last() {
+    async fn rotates_client_code_reactivates_revoked_clients_and_sorts_them_last() {
         let db = setup().await;
         let current = now();
         db.create_client("z-active", "AAAAAAAA", current + 100)
@@ -590,11 +590,6 @@ mod tests {
         db.revoke_client("a-revoked").await.unwrap();
 
         assert!(db.rotate_client_code("z-active", "CCCCCCCC").await.unwrap());
-        assert!(
-            !db.rotate_client_code("a-revoked", "DDDDDDDD")
-                .await
-                .unwrap()
-        );
         assert!(db.client_for_code("AAAAAAAA").await.unwrap().is_none());
         assert_eq!(
             db.client_for_code("CCCCCCCC").await.unwrap().unwrap().name,
@@ -608,6 +603,25 @@ mod tests {
                 .map(|client| client.name.as_str())
                 .collect::<Vec<_>>(),
             ["z-active", "a-revoked"]
+        );
+
+        assert!(
+            db.rotate_client_code("a-revoked", "DDDDDDDD")
+                .await
+                .unwrap()
+        );
+        assert!(db.client_for_code("BBBBBBBB").await.unwrap().is_none());
+        let restored = db.client_for_code("DDDDDDDD").await.unwrap().unwrap();
+        assert_eq!(restored.name, "a-revoked");
+        assert!(restored.revoked_at.is_none());
+        assert_eq!(
+            db.list_clients()
+                .await
+                .unwrap()
+                .iter()
+                .map(|client| client.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a-revoked", "z-active"]
         );
     }
 
