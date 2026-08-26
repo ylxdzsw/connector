@@ -2,13 +2,14 @@ use std::{
     fs::OpenOptions,
     io::{BufRead, BufReader, Write},
     os::fd::AsRawFd,
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use connector::{crypto::normalize_code, mcp::ClientMcp};
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, channel::mpsc};
 use rmcp::{
     ServiceExt,
     model::{ClientJsonRpcMessage, ServerJsonRpcMessage},
@@ -18,6 +19,7 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, client::IntoClientRequest},
 };
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -158,31 +160,85 @@ async fn connect(endpoint: &str, code: &str) -> Result<(), LinkError> {
         Err(error) => return Err(LinkError::Other(error.into())),
     };
     tracing::info!("connected");
-    let (sink, stream) = socket.split();
-    let sink = sink.with(|message: ServerJsonRpcMessage| async move {
-        Ok::<_, tokio_tungstenite::tungstenite::Error>(Message::Text(
-            serde_json::to_string(&message)
-                .expect("MCP message serializes")
-                .into(),
-        ))
-    });
-    let stream = stream.filter_map(|message| async move {
-        match message {
-            Ok(Message::Text(text)) => serde_json::from_str::<ClientJsonRpcMessage>(&text)
-                .map_err(|error| tracing::warn!(%error, "invalid gateway MCP message"))
-                .ok(),
-            _ => None,
-        }
-    });
+    let cancel = CancellationToken::new();
+    let (outgoing, outgoing_rx) = mpsc::unbounded::<ServerJsonRpcMessage>();
+    let (incoming_tx, incoming) = mpsc::unbounded::<ClientJsonRpcMessage>();
+    let mut io_task = tokio::spawn(websocket_io(
+        socket,
+        outgoing_rx,
+        incoming_tx,
+        cancel.clone(),
+    ));
     let service = ClientMcp::default()
-        .serve((Box::pin(sink), Box::pin(stream)))
+        .serve((outgoing, incoming))
         .await
         .map_err(|e| LinkError::Other(e.into()))?;
-    service
-        .waiting()
-        .await
-        .map_err(|e| LinkError::Other(e.into()))?;
+    tokio::select! {
+        result = service.waiting() => {
+            result.map_err(|e| LinkError::Other(e.into()))?;
+        }
+        _ = &mut io_task => {}
+    }
+    cancel.cancel();
+    if !io_task.is_finished() {
+        let _ = io_task.await;
+    }
     Ok(())
+}
+
+async fn websocket_io(
+    socket: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    mut outgoing: mpsc::UnboundedReceiver<ServerJsonRpcMessage>,
+    incoming: mpsc::UnboundedSender<ClientJsonRpcMessage>,
+    cancel: CancellationToken,
+) {
+    let (mut write, mut read) = socket.split();
+    let last_pong = Arc::new(std::sync::Mutex::new(Instant::now()));
+    let reader_pong = last_pong.clone();
+    let reader_cancel = cancel.clone();
+    let mut reader = tokio::spawn(async move {
+        while let Some(message) = read.next().await {
+            match message {
+                Ok(Message::Text(text)) => match serde_json::from_str(&text) {
+                    Ok(message) => {
+                        if incoming.unbounded_send(message).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "invalid gateway MCP message"),
+                },
+                Ok(Message::Pong(_)) => *reader_pong.lock().expect("pong lock") = Instant::now(),
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {}
+            }
+        }
+        reader_cancel.cancel();
+    });
+    let mut ping = tokio::time::interval(Duration::from_secs(15));
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = ping.tick() => {
+                if last_pong.lock().expect("pong lock").elapsed() > Duration::from_secs(45) { break; }
+                if write.send(Message::Ping(Vec::new().into())).await.is_err() { break; }
+            }
+            message = outgoing.next() => match message {
+                Some(message) => if write.send(Message::Text(serde_json::to_string(&message).expect("MCP message serializes").into())).await.is_err() { break; },
+                None => break,
+            }
+        }
+    }
+    cancel.cancel();
+    let _ = write.send(Message::Close(None)).await;
+    drop(write);
+    if tokio::time::timeout(Duration::from_secs(2), &mut reader)
+        .await
+        .is_err()
+    {
+        reader.abort();
+    }
 }
 
 #[cfg(test)]
