@@ -175,13 +175,13 @@ ChatGPT reads the protected-resource and authorization-server metadata.
 
 ### 2. Authorization request
 
-ChatGPT opens `/oauth/authorize` in the user's browser with:
+ChatGPT opens `/oauth/authorize` in the user's browser with a request such as:
 
 ```text
 response_type=code
 client_id=<registered ChatGPT client>
 redirect_uri=<registered ChatGPT callback>
-scope=control offline_access
+scope=control
 resource=https://connector.ylxdzsw.com/mcp
 code_challenge=<PKCE challenge>
 code_challenge_method=S256
@@ -229,9 +229,11 @@ ChatGPT authenticates with HTTP Basic and exchanges the code at `/oauth/token`.
 The request repeats the redirect URI and resource and supplies the PKCE
 verifier. The gateway validates all bindings and atomically consumes the code.
 
-The response contains a short-lived access token and, when `offline_access` was
-granted, a refresh token. The access token is bound to the controller subject,
-OAuth client, `control` scope, and Connector resource.
+The response contains a short-lived access token and a rotating refresh token.
+`offline_access` remains accepted and advertised as a protocol-level scope, but
+refresh-token issuance does not depend on ChatGPT requesting it. The access
+token is bound to the controller subject, OAuth client, `control` scope, and
+Connector resource.
 
 ### 5. MCP requests
 

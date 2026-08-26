@@ -282,20 +282,15 @@ impl Database {
         }
         insert_access(&tx, &access, grant_id, client_id, &scopes, resource)
             .map_err(|_| OAuthError::Storage)?;
-        let refresh_token = if scope_has(&scopes, "offline_access") {
-            insert_refresh(&tx, &refresh, grant_id, client_id, &scopes, resource)
-                .map_err(|_| OAuthError::Storage)?;
-            Some(refresh)
-        } else {
-            None
-        };
+        insert_refresh(&tx, &refresh, grant_id, client_id, &scopes, resource)
+            .map_err(|_| OAuthError::Storage)?;
         tx.commit().map_err(|_| OAuthError::Storage)?;
         Ok(TokenIssue {
             access_token: access,
             token_type: "Bearer",
             expires_in: ACCESS_TTL,
             scope: scopes,
-            refresh_token,
+            refresh_token: Some(refresh),
         })
     }
 
@@ -634,7 +629,7 @@ mod tests {
                 client_id: "chatgpt".into(),
                 redirect_uri: "https://example.com/callback".into(),
                 resource: "https://connector.test/mcp".into(),
-                scopes: "control offline_access".into(),
+                scopes: "control".into(),
                 code_challenge: pkce_s256(&"x".repeat(43)),
             })
             .await
