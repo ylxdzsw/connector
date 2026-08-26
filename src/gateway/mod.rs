@@ -108,6 +108,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(management))
         .route("/clients", post(create_client))
         .route("/clients/{name}/extend", post(extend_client))
+        .route("/clients/{name}/rotate", post(rotate_client))
         .route("/clients/{name}/revoke", post(revoke_client))
         .route("/grants/{id}/revoke", post(revoke_grant))
         .route("/oauth/authorize", get(authorize).post(authorize_consent))
@@ -546,7 +547,13 @@ async fn create_client(
             &format!("The name or code already exists: {error}"),
         );
     }
-    render_management(&state, &headers, &owner, Some((&form.name, &code))).await
+    render_management(
+        &state,
+        &headers,
+        &owner,
+        Some(("Client created", &form.name, &code)),
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -594,6 +601,46 @@ async fn extend_client(
     }
 }
 
+async fn rotate_client(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let owner = match subject(&headers) {
+        Ok(v) => v,
+        Err(status) => return status.into_response(),
+    };
+    if !check_csrf(&headers, &form.csrf) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let code = connection_code();
+    match state.db.rotate_client_code(&name, &code).await {
+        Ok(true) => {
+            if let Some(client) = state.clients.write().await.remove(&name) {
+                client.disconnect.cancel();
+            }
+            render_management(
+                &state,
+                &headers,
+                &owner,
+                Some(("Connection code rotated", &name, &code)),
+            )
+            .await
+        }
+        Ok(false) => error_page(
+            StatusCode::NOT_FOUND,
+            "Client code not rotated",
+            "The client does not exist or has been revoked.",
+        ),
+        Err(error) => error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Client code not rotated",
+            &error.to_string(),
+        ),
+    }
+}
+
 async fn revoke_client(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -633,21 +680,22 @@ async fn render_management(
     state: &AppState,
     headers: &HeaderMap,
     owner: &str,
-    created: Option<(&str, &str)>,
+    notice_data: Option<(&str, &str, &str)>,
 ) -> Response {
     let clients = state.db.list_clients().await.unwrap_or_default();
     let grants = state.db.list_grants().await.unwrap_or_default();
     let online: HashSet<_> = state.clients.read().await.keys().cloned().collect();
     let (csrf, set_cookie) = csrf_for(headers);
-    let notice = created
-        .map(|(name, code)| {
+    let notice = notice_data
+        .map(|(action, name, code)| {
             let command = format!(
                 "curl -fsSL {}/connect | bash -s -- {}",
                 PUBLIC_URL,
                 shell_quote(code)
             );
             format!(
-                "<div class=\"notice\"><strong>Client {} created</strong>Copy and run this command on the client host: <code>{}</code><br><small>This command contains the reusable connection credential and is shown only once.</small></div>",
+                "<div class=\"notice\"><strong>{} for client {}</strong>Copy and run this command on the client host: <code>{}</code><br><small>This command contains the reusable connection credential and is shown only once.</small></div>",
+                escape(action),
                 escape(name),
                 escape(&command)
             )
@@ -659,7 +707,7 @@ async fn render_management(
         let now = Utc::now().timestamp();
         clients.into_iter().map(|client| {
             let status = if client.revoked_at.is_some() { "<span class=\"pill revoked\">Revoked</span>" } else if client.expires_at <= now { "<span class=\"pill expired\">Expired</span>" } else if online.contains(&client.name) { "<span class=\"pill online\">Online</span>" } else { "<span class=\"pill\">Offline</span>" };
-            let action = if client.revoked_at.is_none() { format!("<div class=\"client-actions\"><form class=\"extend\" method=\"post\" action=\"/clients/{}/extend\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><input required type=\"number\" min=\"1\" max=\"3650\" value=\"30\" name=\"days\" aria-label=\"Days to extend\" title=\"Days to extend\"><button class=\"secondary\">Extend</button></form><form method=\"post\" action=\"/clients/{}/revoke\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><button class=\"danger\">Revoke</button></form></div>", escape(&client.name), escape(&csrf), escape(&client.name), escape(&csrf)) } else { String::new() };
+            let action = if client.revoked_at.is_none() { format!("<div class=\"client-actions\"><form class=\"extend\" method=\"post\" action=\"/clients/{}/extend\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><input required type=\"number\" min=\"1\" max=\"3650\" value=\"30\" name=\"days\" aria-label=\"Days to extend\" title=\"Days to extend\"><button class=\"secondary\">Extend</button></form><form method=\"post\" action=\"/clients/{}/rotate\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><button class=\"secondary\">Rotate code</button></form><form method=\"post\" action=\"/clients/{}/revoke\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><button class=\"danger\">Revoke</button></form></div>", escape(&client.name), escape(&csrf), escape(&client.name), escape(&csrf), escape(&client.name), escape(&csrf)) } else { String::new() };
             format!("<tr><td><strong>{}</strong></td><td>{}</td><td>{}</td><td class=\"actions\">{}</td></tr>", escape(&client.name), status, time_label(client.expires_at), action)
         }).collect()
     };

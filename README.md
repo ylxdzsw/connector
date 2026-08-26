@@ -71,7 +71,9 @@ command argument, `connector-client` still reads the code without echo from
 `/dev/tty`.
 
 The management page can extend a non-revoked client credential without changing
-its connection code. The client logs each Bash command, working directory,
+its connection code, or rotate the code to invalidate the previous command. A
+rotation disconnects the current client link; run the newly displayed command
+to reconnect it. The client logs each Bash command, working directory,
 timeout, and full standard input before execution. After execution it logs the
 combined standard output and error plus the exit code. Operators must protect
 these process logs because they can contain sensitive data.

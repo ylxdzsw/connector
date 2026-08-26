@@ -155,8 +155,10 @@ impl Database {
 
     pub async fn list_clients(&self) -> Result<Vec<ClientRecord>> {
         let connection = self.0.lock().await;
-        let mut statement = connection
-            .prepare("SELECT name, code, expires_at, revoked_at FROM clients ORDER BY name")?;
+        let mut statement = connection.prepare(
+            "SELECT name, code, expires_at, revoked_at FROM clients
+                 ORDER BY (revoked_at IS NOT NULL), name",
+        )?;
         let records = statement
             .query_map([], |row| {
                 Ok(ClientRecord {
@@ -194,6 +196,14 @@ impl Database {
         Ok(connection.execute(
             "UPDATE clients SET revoked_at=?2 WHERE name=?1 AND revoked_at IS NULL",
             params![name, now()],
+        )? == 1)
+    }
+
+    pub async fn rotate_client_code(&self, name: &str, code: &str) -> Result<bool> {
+        let connection = self.0.lock().await;
+        Ok(connection.execute(
+            "UPDATE clients SET code=?2 WHERE name=?1 AND revoked_at IS NULL",
+            params![name, code],
         )? == 1)
     }
 
@@ -565,6 +575,40 @@ mod tests {
             .unwrap();
         assert_eq!(active.expires_at, current + 100 + 2 * 86_400);
         assert!(expired.expires_at >= current + 2 * 86_400);
+    }
+
+    #[tokio::test]
+    async fn rotates_active_client_code_and_sorts_revoked_clients_last() {
+        let db = setup().await;
+        let current = now();
+        db.create_client("z-active", "AAAAAAAA", current + 100)
+            .await
+            .unwrap();
+        db.create_client("a-revoked", "BBBBBBBB", current + 100)
+            .await
+            .unwrap();
+        db.revoke_client("a-revoked").await.unwrap();
+
+        assert!(db.rotate_client_code("z-active", "CCCCCCCC").await.unwrap());
+        assert!(
+            !db.rotate_client_code("a-revoked", "DDDDDDDD")
+                .await
+                .unwrap()
+        );
+        assert!(db.client_for_code("AAAAAAAA").await.unwrap().is_none());
+        assert_eq!(
+            db.client_for_code("CCCCCCCC").await.unwrap().unwrap().name,
+            "z-active"
+        );
+
+        let clients = db.list_clients().await.unwrap();
+        assert_eq!(
+            clients
+                .iter()
+                .map(|client| client.name.as_str())
+                .collect::<Vec<_>>(),
+            ["z-active", "a-revoked"]
+        );
     }
 
     #[tokio::test]
