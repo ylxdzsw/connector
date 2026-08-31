@@ -1,5 +1,8 @@
 use std::{path::PathBuf, process::Stdio, time::Duration};
 
+#[cfg(windows)]
+use std::io::Read;
+
 use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncWriteExt, process::Command, time};
 
@@ -99,6 +102,8 @@ async fn run_platform(args: RunArgs, timeout: u64) -> Result<RunOutput, String> 
         args.command
     );
     let script = CommandScript::new(&script)?;
+    let (mut output_reader, output_writer) = std::io::pipe()
+        .map_err(|error| format!("could not create command output pipe: {error}"))?;
     let mut command = Command::new("pwsh");
     command
         .args([
@@ -115,8 +120,10 @@ async fn run_platform(args: RunArgs, timeout: u64) -> Result<RunOutput, String> 
         } else {
             Stdio::null()
         })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(output_writer.try_clone().map_err(|error| {
+            format!("could not clone command output pipe: {error}")
+        })?))
+        .stderr(Stdio::from(output_writer))
         .kill_on_drop(true);
     if let Some(cwd) = args.cwd {
         command.current_dir(cwd);
@@ -125,6 +132,11 @@ async fn run_platform(args: RunArgs, timeout: u64) -> Result<RunOutput, String> 
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not start pwsh: {error}"))?;
+    drop(command);
+    let output_task = tokio::task::spawn_blocking(move || {
+        let mut output = Vec::new();
+        output_reader.read_to_end(&mut output).map(|_| output)
+    });
     if let Some(input) = args.stdin {
         let mut stdin = child
             .stdin
@@ -134,13 +146,24 @@ async fn run_platform(args: RunArgs, timeout: u64) -> Result<RunOutput, String> 
             let _ = stdin.write_all(input.as_bytes()).await;
         });
     }
-    match time::timeout(Duration::from_secs(timeout), child.wait_with_output()).await {
-        Ok(Ok(result)) => Ok(RunOutput {
-            output: String::from_utf8_lossy(&result.stdout).into_owned(),
-            exit_code: result.status.code().unwrap_or(1),
-        }),
+    match time::timeout(Duration::from_secs(timeout), child.wait()).await {
+        Ok(Ok(status)) => {
+            let output = output_task
+                .await
+                .map_err(|error| format!("could not join command output task: {error}"))?
+                .map_err(|error| format!("could not read command output: {error}"))?;
+            Ok(RunOutput {
+                output: String::from_utf8_lossy(&output).into_owned(),
+                exit_code: status.code().unwrap_or(1),
+            })
+        }
         Ok(Err(error)) => Err(format!("could not wait for pwsh: {error}")),
-        Err(_) => Err(format!("command timed out after {timeout} seconds")),
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = output_task.await;
+            Err(format!("command timed out after {timeout} seconds"))
+        }
     }
 }
 
