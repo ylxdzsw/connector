@@ -698,11 +698,7 @@ async fn render_management(
                 PUBLIC_URL,
                 shell_quote(code)
             );
-            let windows_command = format!(
-                "& ([scriptblock]::Create((irm {}/connect/windows))) {}",
-                powershell_quote(PUBLIC_URL),
-                powershell_quote(code)
-            );
+            let windows_command = windows_connection_command(PUBLIC_URL, code);
             format!(
                 "<div class=\"notice\"><strong>{} for client {}</strong>Unix: <code>{}</code><br>Windows (PowerShell 7): <code>{}</code><br><small>These commands contain the reusable connection credential and are shown only once.</small></div>",
                 escape(action),
@@ -982,6 +978,14 @@ fn shell_quote(value: &str) -> String {
 
 fn powershell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn windows_connection_command(base: &str, code: &str) -> String {
+    format!(
+        "& ([scriptblock]::Create((irm {}))) {}",
+        powershell_quote(&format!("{base}/connect/windows")),
+        powershell_quote(code)
+    )
 }
 
 async fn windows_connect_script() -> Response {
@@ -1291,5 +1295,13 @@ mod tests {
         assert_eq!(shell_quote("ABC123"), "'ABC123'");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
         assert_eq!(powershell_quote("a'b"), "'a''b'");
+    }
+
+    #[test]
+    fn windows_connection_command_quotes_the_complete_url() {
+        assert_eq!(
+            windows_connection_command("https://connector.example.com", "ABC123"),
+            "& ([scriptblock]::Create((irm 'https://connector.example.com/connect/windows'))) 'ABC123'"
+        );
     }
 }
