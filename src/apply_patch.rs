@@ -2,9 +2,11 @@ use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::OpenOptionsExt,
     path::{Component, Path, PathBuf},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use anyhow::{Context, Result, bail};
 use rand::RngCore;
@@ -787,7 +789,9 @@ fn create_temp_file(directory: &Path, prefix: &str, suffix: &str) -> Result<(Fil
             .collect::<String>();
         let path = directory.join(format!("{prefix}{token}{suffix}"));
         let mut options = OpenOptions::new();
-        options.write(true).read(true).create_new(true).mode(0o600);
+        options.write(true).read(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
         match options.open(&path) {
             Ok(file) => return Ok((file, path)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,

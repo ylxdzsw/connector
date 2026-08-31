@@ -3,17 +3,17 @@
 ## Goal
 
 Connector lets an authenticated MCP controller run non-persistent shell
-commands on Unix clients behind NAT.
+commands on Unix and Windows clients behind NAT.
 
 ```text
-Controller -- MCP/HTTPS --> Nginx -- Unix socket --> Gateway -- MCP/WebSocket --> Client -- bash -lc
+Controller -- MCP/HTTPS --> Nginx -- Unix socket --> Gateway -- MCP/WebSocket --> Client -- bash/pwsh
                                                    |
                                                    +-- newline JSON-RPC on Unix sockets
 ```
 
-The first version supports Unix clients, fresh shell commands, and best-effort
-desktop screenshots. Windows, persistent terminals, and remote input are
-future work.
+Clients support fresh shell commands and best-effort desktop screenshots.
+Persistent terminals and remote input are future work. The gateway remains
+Unix-only.
 
 ## Participants
 
@@ -106,6 +106,11 @@ from `/dev/tty` without echo.
 The distributed Linux client is built against musl as a fully static
 executable. It has no glibc or shared-library dependency, although a separate
 artifact is still required for each CPU architecture.
+
+The x86-64 Windows client is built with the MSVC Rust target and requires
+PowerShell 7 (`pwsh.exe`). The management site displays a one-command
+PowerShell bootstrap that downloads a temporary executable and runs it with
+the connection code, matching the Unix download-and-run flow.
 
 The client sends the code as a bearer credential to `/link`. The gateway looks
 it up directly, obtains the corresponding name, and then upgrades the
@@ -340,12 +345,16 @@ the Nginx worker group to traverse to the mode-`0660` HTTP gateway socket
 without listing the directory or accessing channels. The gateway removes a
 channel socket on disconnect.
 
-## Bash Execution
+## Shell Execution
 
-Each call starts a fresh `bash -lc` process. `cwd` selects its working
-directory, `stdin` supplies literal input, and `timeout` bounds execution. The
-process exits before the call completes; shell state never carries between
-calls.
+Each call starts a fresh `bash -lc` process on Unix or `pwsh` process on
+Windows. `cwd` selects its working directory, `stdin` supplies literal input,
+and `timeout` bounds execution. The process exits before the call completes;
+shell state never carries between calls.
+
+Windows command text is written to a temporary `.ps1` and run with PowerShell
+profiles and interactive prompts disabled. This keeps standard input available
+for the tool call and avoids Windows command-line quoting and length limits.
 
 Before execution, the client logs the command, working directory, timeout, and
 full standard input to standard error through its tracing subscriber. After
@@ -380,22 +389,22 @@ service supervisor and must be treated as sensitive.
 
 ## Screenshot Capture
 
-Each `screenshot` call detects the graphical session and invokes common capture
-software found in the client's `PATH`. Wayland uses desktop-native tools and
-`grim`; X11 uses desktop-native tools, `maim`, `scrot`, or ImageMagick. Commands
-are invoked directly without a shell. A Wayland session never falls back to
-X11 through Xwayland because that can return an incomplete desktop.
+On Unix, each `screenshot` call detects the graphical session and invokes
+common capture software found in the client's `PATH`. Wayland uses
+desktop-native tools and `grim`; X11 uses desktop-native tools, `maim`, `scrot`,
+or ImageMagick. Windows invokes a bounded `pwsh` script using .NET drawing APIs
+to capture the interactive virtual desktop as JPEG.
 
 Capture is best-effort and has no persistent session state. One capture runs at
-a time. Programs have bounded execution time, write into a private temporary
-directory, and are killed with their process group on timeout or cancellation.
-Only valid PNG and JPEG output is accepted. Images are limited to 8 MiB; when
-available, ImageMagick may reduce an oversized valid capture to a bounded JPEG.
+a time. Capture programs have bounded execution time and write into a private
+temporary directory. Only valid PNG and JPEG output is accepted. Images are
+limited to 8 MiB; when available on Unix, ImageMagick may reduce an oversized
+valid capture to a bounded JPEG.
 
 Connector does not persist screenshots or log their bytes. It logs only the
 selected backend and image size. Screenshots can expose notifications,
 credentials, private application content, and everything else visible to the
-Unix user's graphical session, so controller grants and client logs must be
+user's graphical session, so controller grants and client logs must be
 protected accordingly.
 
 ## State
@@ -453,10 +462,10 @@ grant permits commands on all clients.
 
 ### Client to operating system
 
-Bash and screenshot capture programs run as the Unix user that launched the
-client. Connector does not run the client as root or elevate privileges. OAuth
-control therefore grants all privileges available to that Unix user and can
-expose everything visible in that user's graphical session.
+Shell and screenshot capture programs run as the user that launched the
+client. Connector does not elevate privileges. OAuth control therefore grants
+all privileges available to that user and can expose everything visible in
+that user's graphical session.
 
 ### Local processes
 
@@ -475,8 +484,8 @@ to a channel socket can control that client without OAuth.
 - **Outbound WebSocket links** cross NAT and provide full-duplex relay and
   transport-level liveness.
 - **Exact MCP at both boundaries** avoids a second command protocol.
-- **Non-persistent Bash** matches Mu-style workflows without terminal session
-  APIs.
+- **Non-persistent shell processes** match Mu-style workflows without terminal
+  session APIs.
 - **External screenshot programs** cover common Linux desktops without adding
   native X11, Wayland, portal, or image-codec dependencies to the static client.
 - **Unix sockets** expose live channels to local controllers and represent them

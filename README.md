@@ -1,9 +1,10 @@
 # Connector
 
-Connector lets an OAuth-authorized MCP controller operate Unix machines that
-are behind NAT. Each machine opens an outbound WebSocket to a central gateway;
-the controller can then discover connected machines, run fresh Bash commands,
-apply structured file patches, and capture best-effort desktop screenshots.
+Connector lets an OAuth-authorized MCP controller operate Unix and Windows
+machines that are behind NAT. Each machine opens an outbound WebSocket to a
+central gateway; the controller can then discover connected machines, run
+fresh Bash or PowerShell 7 commands, apply structured file patches, and capture
+best-effort desktop screenshots.
 
 Connector is made of two Rust binaries:
 
@@ -15,7 +16,7 @@ Connector is made of two Rust binaries:
 ```text
 Controller -- MCP/HTTPS --> Nginx -- Unix socket --> Gateway
                                                    |
-                                                   +-- MCP/WebSocket --> Client -- bash -lc
+                                                   +-- MCP/WebSocket --> Client -- bash/pwsh
                                                    +-- MCP over local Unix sockets
 ```
 
@@ -51,7 +52,7 @@ It listens only on `/run/connector/.gateway.sock`; Nginx terminates TLS, applies
 the existing browser cookie gate to management and authorization routes, and
 proxies public MCP, OAuth, download, and client-link routes.
 
-### 2. Connect a Unix machine
+### 2. Connect a machine
 
 Open the management site, create a named client credential, and run the command
 shown by the site on that machine:
@@ -68,6 +69,17 @@ the code from `/dev/tty` without echo.
 The complete command contains a reusable bearer credential. Do not put it in
 shell history, logs, source control, or process supervision configuration.
 Rotating or revoking the credential disconnects the current link.
+
+On x86-64 Windows, install PowerShell 7 and run the Windows command shown by
+the management site from `pwsh`. It has the same download-and-run behavior as
+the Unix command:
+
+```powershell
+& ([scriptblock]::Create((irm 'https://connector.ylxdzsw.com/connect/windows'))) 'CONNECTION_CODE'
+```
+
+The Windows client stays in the foreground and requires `pwsh.exe` in `PATH`.
+It does not open an inbound port, so it works behind NAT without a public IP.
 
 ### 3. Connect an MCP controller
 
@@ -86,7 +98,7 @@ The gateway exposes:
 | Tool | Purpose |
 | --- | --- |
 | `clients()` | List connected clients and their system and shell metadata. |
-| `run(client, command, cwd?, timeout?, stdin?)` | Run one fresh Bash process and return combined output and its exit code. |
+| `run(client, command, cwd?, timeout?, stdin?)` | Run one fresh process using the client's advertised shell and return combined output and its exit code. |
 | `apply_patch(client, patch, cwd?)` | Apply one Mu/Codex-style structured patch after complete preflight. |
 | `screenshot(client)` | Return a PNG or JPEG of the client's full desktop when a supported capture backend is available. |
 
@@ -102,8 +114,8 @@ authorization boundary for this local interface.
 Connector terminates two MCP sessions rather than translating MCP into a
 private command protocol. The external controller is an MCP client of the
 gateway. On the outbound WebSocket link, the gateway is an MCP client of the
-Unix client. The gateway maps calls, results, errors, cancellation, and image
-content between those sessions.
+connected host. The gateway maps calls, results, errors, cancellation, and
+image content between those sessions.
 
 ### Separate credential domains
 
@@ -116,7 +128,7 @@ Three credentials have deliberately separate roles:
 | Client connection code | `/link` | Authenticate one named client link |
 
 No credential is accepted in another role. OAuth grants are global rather than
-per-client, so approval grants the controller the Unix-user privileges of all
+per-client, so approval grants the controller the user privileges of all
 current and future connected clients until expiry or revocation.
 
 ### Outbound links and ephemeral channels
@@ -129,10 +141,11 @@ disconnects and gateway restarts fail in-flight work instead of replaying it.
 
 ### Fresh command processes
 
-Every `run` call starts a new `bash -lc` process with an optional working
-directory, literal standard input, and timeout. Shell state does not carry
-between calls. A nonzero exit status is a normal tool result; startup,
-availability, timeout, and transport failures are tool errors.
+Every `run` call starts a new `bash -lc` process on Unix or `pwsh` process on
+Windows, with an optional working directory, literal standard input, and
+timeout. Shell state does not carry between calls. A nonzero exit status is a
+normal tool result; startup, availability, timeout, and transport failures are
+tool errors.
 
 The client traces complete commands, input, output, and patches. A service
 supervisor may persist those logs, so operators must treat them as sensitive.
@@ -151,10 +164,11 @@ commit fails, the tool reports which earlier changes completed. See
 
 ### Bounded screenshot capture
 
-Screenshots use common Wayland or X11 capture tools already present on the
-client. Capture is serialized, time-bounded, validated as PNG or JPEG, and
-limited to 8 MiB. Connector does not store image bytes, but a successful call
-can expose everything visible in the user's graphical session.
+Screenshots use common Wayland or X11 capture tools on Unix and PowerShell's
+Windows drawing APIs on Windows. Capture is serialized, time-bounded,
+validated as PNG or JPEG, and limited to 8 MiB. Connector does not store image
+bytes, but a successful call can expose everything visible in the user's
+graphical session.
 
 ### Persistent credentials, transient workloads
 
@@ -178,6 +192,16 @@ Release builds use [`scripts/build-release.sh`](scripts/build-release.sh). The
 client target defaults to `x86_64-unknown-linux-musl`; set
 `CONNECTOR_CLIENT_TARGET` to another installed musl target for a different CPU
 architecture.
+
+The Windows client is built and tested on a native Windows runner with:
+
+```powershell
+cargo build --release --locked --target x86_64-pc-windows-msvc --bin connector-client
+```
+
+Install that artifact as
+`/opt/connector/connector-client-windows-x86_64.exe` on the Unix gateway. The
+gateway reads it from disk for the Windows download-and-run command.
 
 For protocol details, trust boundaries, OAuth flows, patch behavior, and design
 rationale, read [`DESIGN.md`](DESIGN.md).

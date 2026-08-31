@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     apply_patch::{ApplyPatchArgs, ApplyPatchOutput, apply_patch},
-    execution::{DEFAULT_TIMEOUT, RunArgs, RunOutput, run_bash},
+    execution::{DEFAULT_TIMEOUT, RunArgs, RunOutput, run_shell},
     screenshot,
 };
 
@@ -67,7 +67,7 @@ impl ClientEnvironment {
     fn current() -> Self {
         Self {
             system: std::env::consts::OS.into(),
-            shell: "bash".into(),
+            shell: current_shell().into(),
         }
     }
 }
@@ -292,7 +292,7 @@ impl ServerHandler for ClientMcp {
     fn get_info(&self) -> ServerInfo {
         let mut info = server_info(
             "connector-client",
-            "Run fresh commands with Bash and capture screenshots on this Linux client",
+            "Run fresh commands, apply structured patches, and capture screenshots on this client",
         );
         let mut meta = JsonObject::new();
         meta.insert(
@@ -394,15 +394,17 @@ impl ServerHandler for ClientMcp {
             cwd = ?args.cwd,
             timeout = args.timeout.unwrap_or(DEFAULT_TIMEOUT),
             stdin = ?args.stdin,
-            "executing Bash command"
+            shell = current_shell(),
+            "executing shell command"
         );
-        let result = match run_bash(args).await {
+        let result = match run_shell(args).await {
             Ok(output) => {
                 tracing::info!(
                     request_id = ?context.id,
                     stdout = ?output.output,
                     exit_code = output.exit_code,
-                    "Bash command completed"
+                    shell = current_shell(),
+                    "shell command completed"
                 );
                 run_result(output)
             }
@@ -536,11 +538,21 @@ fn gateway_screenshot_tool() -> Tool {
 fn run_tool(protected: bool) -> Tool {
     let tool = Tool::new(
         "run",
-        "Run one non-persistent Bash command and return combined output and exit code",
+        "Run one non-persistent command using this client's shell and return combined output and exit code",
         schema::<RunArgs>(),
     )
     .with_raw_output_schema(schema::<RunOutput>());
     if protected { secure(tool) } else { tool }
+}
+
+#[cfg(unix)]
+fn current_shell() -> &'static str {
+    "bash"
+}
+
+#[cfg(windows)]
+fn current_shell() -> &'static str {
+    "pwsh"
 }
 
 fn apply_patch_tool(protected: bool) -> Tool {

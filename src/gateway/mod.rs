@@ -42,7 +42,7 @@ use url::Url;
 use crate::{
     config::{
         CLIENT_BINARY, Config, DATABASE, OAUTH_CLIENT_ID, OAUTH_REDIRECT_URI, PUBLIC_URL,
-        RESOURCE_URL, SOCKET_DIR, SUBJECT_HEADER,
+        RESOURCE_URL, SOCKET_DIR, SUBJECT_HEADER, WINDOWS_CLIENT_BINARY,
     },
     crypto::{connection_code, normalize_code, random_token},
     db::{AuthCodeBinding, Database, OAuthError},
@@ -124,7 +124,12 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/link", get(link))
         .route("/connect", get(connect_script))
+        .route("/connect/windows", get(windows_connect_script))
         .route("/download/client", get(download_client))
+        .route(
+            "/download/client/windows-x86_64",
+            get(download_windows_client),
+        )
         .route("/assets/styles.css", get(styles))
         .merge(protected_mcp)
         .layer(TraceLayer::new_for_http())
@@ -688,16 +693,22 @@ async fn render_management(
     let (csrf, set_cookie) = csrf_for(headers);
     let notice = notice_data
         .map(|(action, name, code)| {
-            let command = format!(
+            let unix_command = format!(
                 "curl -fsSL {}/connect | bash -s -- {}",
                 PUBLIC_URL,
                 shell_quote(code)
             );
+            let windows_command = format!(
+                "& ([scriptblock]::Create((irm {}/connect/windows))) {}",
+                powershell_quote(PUBLIC_URL),
+                powershell_quote(code)
+            );
             format!(
-                "<div class=\"notice\"><strong>{} for client {}</strong>Copy and run this command on the client host: <code>{}</code><br><small>This command contains the reusable connection credential and is shown only once.</small></div>",
+                "<div class=\"notice\"><strong>{} for client {}</strong>Unix: <code>{}</code><br>Windows (PowerShell 7): <code>{}</code><br><small>These commands contain the reusable connection credential and are shown only once.</small></div>",
                 escape(action),
                 escape(name),
-                escape(&command)
+                escape(&unix_command),
+                escape(&windows_command)
             )
         })
         .unwrap_or_default();
@@ -724,7 +735,7 @@ async fn render_management(
     let body = format!(
         r#"
 <header class="topbar"><div class="topbar-inner"><div class="brand"><span class="mark">C</span>Connector</div><span class="subject">{}</span></div></header>
-<main>{}<div class="page-head"><div><h1>Connection control</h1><p>Provision Unix clients and manage controller access.</p></div><span class="status"><span class="dot online"></span>{} client{} online</span></div>
+<main>{}<div class="page-head"><div><h1>Connection control</h1><p>Provision clients and manage controller access.</p></div><span class="status"><span class="dot online"></span>{} client{} online</span></div>
 <section><div class="section-head"><h2>Connect a client</h2></div><div class="panel"><div class="command"><code>Create a credential to get a copyable connection command.</code></div><form class="create" method="post" action="/clients"><input type="hidden" name="csrf" value="{}"><label>Client name<input required maxlength="64" name="name" placeholder="build-server" pattern="[A-Za-z0-9][A-Za-z0-9._-]*"></label><label>Valid for<input required type="number" min="1" max="3650" value="30" name="days"></label><button>Create credential</button></form></div></section>
 <section class="section"><div class="section-head"><h2>Clients</h2></div><div class="panel table-wrap"><table><thead><tr><th>Name</th><th>Status</th><th>Expires</th><th></th></tr></thead><tbody>{}</tbody></table></div></section>
 <section class="section"><div class="section-head"><h2>Controller grants</h2></div><div class="panel table-wrap"><table><thead><tr><th>Controller</th><th>Scopes</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody>{}</tbody></table></div></section>
@@ -969,6 +980,45 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+async fn windows_connect_script() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        windows_connect_script_body(PUBLIC_URL),
+    )
+        .into_response()
+}
+
+fn windows_connect_script_body(base: &str) -> String {
+    format!(
+        r#"param([Parameter(Mandatory=$true, Position=0)][string]$Code)
+$ErrorActionPreference = 'Stop'
+if ($PSVersionTable.PSVersion.Major -lt 7) {{ throw 'PowerShell 7 (pwsh) is required' }}
+$installed = Get-Command connector-client.exe -CommandType Application -ErrorAction SilentlyContinue
+$temporary = $null
+if ($null -ne $installed) {{
+    $client = $installed.Source
+}} else {{
+    $temporary = Join-Path ([IO.Path]::GetTempPath()) ("connector-client-" + [guid]::NewGuid().ToString("N") + ".exe")
+    Invoke-WebRequest '{base}/download/client/windows-x86_64' -OutFile $temporary
+    $client = $temporary
+}}
+try {{
+    & $client --gateway '{base}' --code $Code
+    if ($LASTEXITCODE -ne 0) {{ throw "connector-client exited with code $LASTEXITCODE" }}
+}} finally {{
+    if ($null -ne $temporary) {{ Remove-Item $temporary -Force -ErrorAction SilentlyContinue }}
+}}
+"#
+    )
+}
+
 async fn download_client() -> Response {
     match tokio::fs::read(CLIENT_BINARY).await {
         Ok(binary) => (
@@ -985,6 +1035,27 @@ async fn download_client() -> Response {
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "Client binary is not available on the gateway",
+        )
+            .into_response(),
+    }
+}
+
+async fn download_windows_client() -> Response {
+    match tokio::fs::read(WINDOWS_CLIENT_BINARY).await {
+        Ok(binary) => (
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=connector-client.exe",
+                ),
+            ],
+            binary,
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Windows client binary is not available on the gateway",
         )
             .into_response(),
     }
@@ -1201,8 +1272,24 @@ mod tests {
     }
 
     #[test]
+    fn windows_connect_script_checks_for_an_installed_client_before_downloading() {
+        let script = windows_connect_script_body("https://connector.example.com");
+        let check = script.find("Get-Command connector-client.exe").unwrap();
+        let download = script
+            .find(
+                "Invoke-WebRequest 'https://connector.example.com/download/client/windows-x86_64'",
+            )
+            .unwrap();
+        assert!(check < download);
+        assert!(
+            script.contains("& $client --gateway 'https://connector.example.com' --code $Code")
+        );
+    }
+
+    #[test]
     fn shell_quotes_connection_command_values() {
         assert_eq!(shell_quote("ABC123"), "'ABC123'");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+        assert_eq!(powershell_quote("a'b"), "'a''b'");
     }
 }

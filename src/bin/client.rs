@@ -1,12 +1,9 @@
 use std::{
-    fs::OpenOptions,
-    io::{BufRead, BufReader, Write},
-    os::fd::AsRawFd,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::Parser;
 use connector::{crypto::normalize_code, mcp::ClientMcp};
 use futures::{SinkExt, StreamExt, channel::mpsc};
@@ -23,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(version, about = "Connect this Unix host to a Connector gateway")]
+#[command(version, about = "Connect this host to a Connector gateway")]
 struct Args {
     #[arg(long, default_value = "https://connector.ylxdzsw.com")]
     gateway: String,
@@ -71,19 +68,7 @@ async fn main() -> Result<()> {
 }
 
 fn read_code() -> Result<String> {
-    let mut tty = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .context("open /dev/tty to read the connection code")?;
-    tty.write_all(b"Connector connection code: ")?;
-    tty.flush()?;
-    let echo = EchoGuard::disable(tty.as_raw_fd())?;
-    let mut code = String::new();
-    let mut reader = BufReader::new(tty);
-    reader.read_line(&mut code)?;
-    drop(echo);
-    reader.get_mut().write_all(b"\n")?;
+    let code = rpassword::prompt_password("Connector connection code: ")?;
     validate_code(&code)
 }
 
@@ -93,33 +78,6 @@ fn validate_code(value: &str) -> Result<String> {
         bail!("connection code must contain 8 characters");
     }
     Ok(code)
-}
-
-struct EchoGuard {
-    fd: i32,
-    original: libc::termios,
-}
-
-impl EchoGuard {
-    fn disable(fd: i32) -> Result<Self> {
-        let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
-        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let original = unsafe { original.assume_init() };
-        let mut hidden = original;
-        hidden.c_lflag &= !libc::ECHO;
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &hidden) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(Self { fd, original })
-    }
-}
-
-impl Drop for EchoGuard {
-    fn drop(&mut self) {
-        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
-    }
 }
 
 fn websocket_endpoint(gateway: &str) -> Result<String> {
