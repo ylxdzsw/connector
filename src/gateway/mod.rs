@@ -1003,7 +1003,8 @@ fn windows_connect_script_body(base: &str) -> String {
     format!(
         r#"param([Parameter(Mandatory=$true, Position=0)][string]$Code)
 $ErrorActionPreference = 'Stop'
-if ($PSVersionTable.PSVersion.Major -lt 7) {{ throw 'PowerShell 7 (pwsh) is required' }}
+$pwsh = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue
+if ($null -eq $pwsh) {{ throw 'PowerShell 7 (pwsh.exe) is required in PATH' }}
 $installed = Get-Command connector-client.exe -CommandType Application -ErrorAction SilentlyContinue
 $temporary = $null
 if ($null -ne $installed) {{
@@ -1279,6 +1280,7 @@ mod tests {
     fn windows_connect_script_checks_for_an_installed_client_before_downloading() {
         let script = windows_connect_script_body("https://connector.example.com");
         let check = script.find("Get-Command connector-client.exe").unwrap();
+        assert!(script.contains("Get-Command pwsh.exe -CommandType Application"));
         let download = script
             .find(
                 "Invoke-WebRequest 'https://connector.example.com/download/client/windows-x86_64'",
