@@ -11,9 +11,9 @@ Controller -- MCP/HTTPS --> Nginx -- Unix socket --> Gateway -- MCP/WebSocket --
                                                    +-- newline JSON-RPC on Unix sockets
 ```
 
-Clients support fresh shell commands and best-effort desktop screenshots.
-Persistent terminals and remote input are future work. The gateway remains
-Unix-only.
+Clients support fresh shell commands, best-effort desktop screenshots, and
+batched Windows/X11 mouse and keyboard input. Persistent terminals are future
+work. The gateway remains Unix-only.
 
 ## Participants
 
@@ -203,9 +203,9 @@ The gateway validates the OAuth client, exact redirect URI, scope, resource,
 and PKCE method. It then asks the user to approve this grant:
 
 ```text
-Allow this controller to run shell commands, apply structured file patches, and
-capture graphical desktop screenshots on all current and future connected
-clients until access is revoked?
+Allow this controller to run shell commands, apply structured file patches,
+capture graphical desktop screenshots, and control the mouse and keyboard on
+all current and future connected clients until access is revoked?
 ```
 
 The consent POST uses CSRF protection. Consent is recorded for the authenticated
@@ -268,19 +268,21 @@ revocation closes that client's link. The two operations are independent.
 The gateway exposes standard MCP Streamable HTTP at `/mcp`. It is the MCP
 server; the controller is the MCP client.
 
-The gateway exposes four tools:
+The gateway exposes five tools:
 
 ```text
 clients()
 run(client, command, cwd?, timeout?, stdin?)
 apply_patch(client, patch, cwd?)
 screenshot(client)
+computer(client, actions)
 ```
 
-`clients` returns each connected client's name, system, and shell. For example:
+`clients` returns each connected client's name, system, shell, and desktop-input
+capability. For example:
 
 ```json
-{"clients":[{"name":"build-server","system":"linux","shell":"bash"}]}
+{"clients":[{"name":"workstation","system":"linux","shell":"bash","computer":{"available":true,"backend":"x11-xdotool"}}]}
 ```
 
 The result is only a snapshot; callers must handle a client disconnecting
@@ -300,6 +302,13 @@ standard MCP PNG or JPEG image. The tool is always present; a headless client,
 an unsupported platform, or a client without a usable capture program returns
 a tool-level availability error.
 
+`computer` executes a short sequential input batch and always attempts one
+final screenshot. An empty batch only captures. Input capability is probed
+without sending events at each link initialization and advertised in client
+environment metadata. Unavailable input reports `available: false` and a
+`reason`; older clients without this metadata default to unavailable. This
+snapshot is advisory; every input call checks current desktop access.
+
 All tools declare OAuth security metadata requiring the `control` scope.
 
 ### Gateway to client
@@ -312,19 +321,20 @@ text frame contains one complete UTF-8 MCP message. The client credential is
 authenticated during upgrade, and WebSocket Ping/Pong provides liveness. No
 private heartbeat or authentication messages are mixed into MCP.
 
-The client exposes three tools:
+The client exposes four tools:
 
 ```text
 run(command, cwd?, timeout?, stdin?)
 apply_patch(patch, cwd?)
 screenshot()
+computer(actions)
 ```
 
-The client reports its system and shell in standard MCP initialization
-metadata. The gateway terminates the external and internal MCP sessions. It
+The client reports its system, shell, and input capability in standard MCP
+initialization metadata. The gateway terminates the external and internal MCP sessions. It
 handles `clients` itself and maps external `run` and `apply_patch` calls to the
 selected client's corresponding tools. It also relays `screenshot` calls and
-their MCP image content.
+their MCP image content, along with `computer` batches and results.
 Request IDs, results, errors, and cancellation are mapped through both
 sessions. A client that omits its environment metadata or provides malformed
 values is rejected during link initialization.
@@ -338,8 +348,8 @@ While a client is connected, the gateway listens on:
 ```
 
 The socket exposes that client's `run(command, cwd?, timeout?, stdin?)`,
-`apply_patch(patch, cwd?)`, and `screenshot()` tools using newline-delimited MCP
-JSON-RPC.
+`apply_patch(patch, cwd?)`, `screenshot()`, and `computer(actions)` tools using
+newline-delimited MCP JSON-RPC.
 Channel sockets are mode `0600`. The runtime directory is mode `0710`, allowing
 the Nginx worker group to traverse to the mode-`0660` HTTP gateway socket
 without listing the directory or accessing channels. The gateway removes a
@@ -395,17 +405,72 @@ desktop-native tools and `grim`; X11 uses desktop-native tools, `maim`, `scrot`,
 or ImageMagick. Windows invokes a bounded `pwsh` script using .NET drawing APIs
 to capture the interactive virtual desktop as JPEG.
 
-Capture is best-effort and has no persistent session state. One capture runs at
-a time. Capture programs have bounded execution time and write into a private
-temporary directory. Only valid PNG and JPEG output is accepted. Images are
+Capture is best-effort. A process-wide desktop lock serializes capture and
+computer batches, including across reconnects. Capture programs have bounded
+execution time and write into a private temporary directory. Only valid PNG
+and JPEG output is accepted. Images are
 limited to 8 MiB; when available on Unix, ImageMagick may reduce an oversized
 valid capture to a bounded JPEG.
+
+Results include image dimensions. The client retains only the latest
+screenshot-to-input geometry, not the image bytes. A small PNG/JPEG header
+reader extracts dimensions without image-codec dependencies; Unix reduction
+preserves the original dimensions for coordinate mapping. Windows capture
+and input both use per-monitor-aware physical pixels.
 
 Connector does not persist screenshots or log their bytes. It logs only the
 selected backend and image size. Screenshots can expose notifications,
 credentials, private application content, and everything else visible to the
 user's graphical session, so controller grants and client logs must be
 protected accordingly.
+
+## Desktop Input
+
+`computer(client, actions)` exposes `move`, `click`, `scroll`, `drag`, `key`,
+`type`, and `wait`. The linked client/local channel omits `client`. Batches
+contain at most 32 actions; click count is 1–3, scroll amount is 1–100 wheel
+steps, key chords contain 1–8 named keys, literal text is at most 8192 UTF-8
+bytes with no NUL, and each wait is at most 5000 ms. There is a 30-second batch
+execution budget checked between actions. Each X11 subprocess has a separate
+5-second timeout; capture has its own timeout. This is not a hard 30-second
+wall-clock limit including lock acquisition, cleanup, and capture.
+
+The controller uses integer pixels from the most recent full screenshot,
+with `(0, 0)` at its top-left. The client maps scaling and native desktop
+offsets. A coordinate action requires a prior mappable screenshot; reconnects
+invalidate the previous mapping after pending desktop work finishes. Capture
+geometry is checked before and after capture, and again before actions;
+changed geometry fails input and the final capture supplies a new observation.
+This does not detect ordinary UI changes or make stale screenshots safe.
+Windows retains virtual-desktop coverage, including negative native origins;
+X11 retains backend-dependent full-X-screen capture. V1 has no per-monitor
+selection, frame IDs, separate-X-screen stitching, or Wayland input.
+
+Windows uses direct user32 FFI and `SendInput`; it does not elevate, bypass
+UIPI, or target the secure desktop. X11 invokes `xdotool` using argument arrays
+and sends literal text through stdin, never shell interpolation. Unicode
+typing is backend/application-dependent and does not alter the clipboard.
+No desktop framework or image-codec dependency is added to the Rust client.
+
+The complete batch is preflighted before input. Actions execute sequentially,
+stop on first failure, and always attempt one final screenshot. Results report
+the number of completed actions, execution error, and image dimensions.
+Failures can leave a partially executed action; capture failure does not imply
+input failure. There is no rollback or automatic replay. A new observation is
+required before deciding whether to retry an interrupted operation.
+
+Keys/buttons are held only inside an action, with best-effort release on
+failure. Cancellation is forwarded through the gateway. A desktop worker
+retains the lock and finishes the current bounded action's cleanup even if
+the MCP caller disconnects; subsequent actions stop. A process crash cannot
+guarantee input release. Human input, other programs, and `run` commands can
+still change the desktop while this lock is held.
+
+Normal Ctrl-C shutdown waits for pending desktop cleanup before exiting.
+
+Logs record batch counts and status, not action payloads or typed text.
+Existing OAuth `control` and local socket authorization apply unchanged;
+desktop input is not a security sandbox alongside unrestricted shell access.
 
 ## State
 

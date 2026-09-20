@@ -2,16 +2,11 @@ use std::{path::PathBuf, process::Stdio, time::Duration};
 
 use tokio::{process::Command, time};
 
+use super::Screenshot;
 use crate::crypto::random_token;
 
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
-
-pub struct Screenshot {
-    pub data: Vec<u8>,
-    pub mime_type: &'static str,
-    pub backend: &'static str,
-}
 
 pub async fn capture() -> Result<Screenshot, String> {
     let directory = CaptureDirectory::new()?;
@@ -62,11 +57,7 @@ pub async fn capture() -> Result<Screenshot, String> {
     if data.len() < 4 || !data.starts_with(b"\xff\xd8\xff") || !data.ends_with(b"\xff\xd9") {
         return Err("screenshot unavailable: pwsh produced an invalid JPEG".into());
     }
-    Ok(Screenshot {
-        data,
-        mime_type: "image/jpeg",
-        backend: "pwsh-system-drawing",
-    })
+    Screenshot::new(data, "image/jpeg", "pwsh-system-drawing", None)
 }
 
 struct CaptureDirectory(PathBuf);
@@ -98,16 +89,31 @@ impl Drop for CaptureDirectory {
 
 const CAPTURE_SCRIPT: &str = r#"
 param([Parameter(Mandatory=$true)][string]$OutputPath)
-Add-Type -AssemblyName System.Drawing
+$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
-$bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
-$bitmap = [System.Drawing.Bitmap]::new($bounds.Width, $bounds.Height)
-$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+Add-Type -AssemblyName System.Drawing
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class ConnectorDpi {
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+}
+'@
+$previous = [ConnectorDpi]::SetThreadDpiAwarenessContext([IntPtr](-4))
+if ($previous -eq [IntPtr]::Zero) { throw 'could not enable per-monitor DPI awareness' }
+$bitmap = $null
+$graphics = $null
 try {
+    $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    if ($bounds.Width -le 0 -or $bounds.Height -le 0) { throw 'the virtual desktop has no usable size' }
+    $bitmap = [System.Drawing.Bitmap]::new($bounds.Width, $bounds.Height)
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
     $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
     $bitmap.Save($OutputPath, [System.Drawing.Imaging.ImageFormat]::Jpeg)
 } finally {
-    $graphics.Dispose()
-    $bitmap.Dispose()
+    if ($null -ne $graphics) { $graphics.Dispose() }
+    if ($null -ne $bitmap) { $bitmap.Dispose() }
+    [void][ConnectorDpi]::SetThreadDpiAwarenessContext($previous)
 }
 "#;

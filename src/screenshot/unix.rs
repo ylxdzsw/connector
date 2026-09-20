@@ -7,20 +7,15 @@ use std::{
     time::Duration,
 };
 
-use tokio::{io::AsyncReadExt, process::Command, time};
+use tokio::{process::Command, time};
 
+use super::{Screenshot, dimensions};
 use crate::crypto::random_token;
 
 const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
-
-pub struct Screenshot {
-    pub data: Vec<u8>,
-    pub mime_type: &'static str,
-    pub backend: &'static str,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionKind {
@@ -143,21 +138,16 @@ async fn capture_with(
         {
             continue;
         }
-        if let Some(image) = read_image(&output, MAX_IMAGE_BYTES).await {
-            return Ok(Screenshot {
-                data: image.0,
-                mime_type: image.1,
-                backend: backend.name(),
-            });
-        }
-        if valid_oversized_image(&output).await
-            && let Some(image) = reduce_image(&directory.0, &output, deadline, path).await
+        if let Some((data, mime)) = read_image(&output, MAX_SOURCE_BYTES).await
+            && let Some(source) = dimensions(&data)
         {
-            return Ok(Screenshot {
-                data: image.0,
-                mime_type: image.1,
-                backend: backend.name(),
-            });
+            if data.len() as u64 <= MAX_IMAGE_BYTES {
+                return Screenshot::new(data, mime, backend.name(), None);
+            }
+            drop(data);
+            if let Some((data, mime)) = reduce_image(&directory.0, &output, deadline, path).await {
+                return Screenshot::new(data, mime, backend.name(), Some(source));
+            }
         }
     }
 
@@ -251,23 +241,6 @@ async fn read_image(path: &Path, limit: u64) -> Option<(Vec<u8>, &'static str)> 
     let data = tokio::fs::read(path).await.ok()?;
     let mime_type = image_mime_type(&data)?;
     Some((data, mime_type))
-}
-
-async fn valid_oversized_image(path: &Path) -> bool {
-    let Ok(metadata) = tokio::fs::metadata(path).await else {
-        return false;
-    };
-    if metadata.len() <= MAX_IMAGE_BYTES || metadata.len() > MAX_SOURCE_BYTES {
-        return false;
-    }
-    let Ok(mut file) = tokio::fs::File::open(path).await else {
-        return false;
-    };
-    let mut header = [0; 8];
-    let Ok(read) = file.read(&mut header).await else {
-        return false;
-    };
-    image_header_mime_type(&header[..read]).is_some()
 }
 
 async fn reduce_image(
@@ -440,7 +413,7 @@ mod tests {
         write_script(
             directory.path().join("spectacle"),
             r#"for output do :; done
-printf '\211PNG\r\n\032\ncontentsIENDxxxx' > "$output""#,
+printf '\211PNG\r\n\032\n\000\000\000\015IHDR\000\000\000\002\000\000\000\003contentsIENDxxxx' > "$output""#,
         );
 
         let screenshot = capture_with(

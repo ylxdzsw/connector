@@ -46,11 +46,16 @@ async fn main() -> Result<()> {
         None => tokio::task::spawn_blocking(read_code).await??,
     };
     let endpoint = websocket_endpoint(&args.gateway)?;
+    let client = ClientMcp::default();
     let mut delay = 1;
     loop {
         let result = tokio::select! {
-            result = connect(&endpoint, &code) => result,
-            _ = tokio::signal::ctrl_c() => return Ok(()),
+            result = connect(&endpoint, &code, &client) => Some(result),
+            _ = tokio::signal::ctrl_c() => None,
+        };
+        let Some(result) = result else {
+            client.finish_desktop().await;
+            return Ok(());
         };
         match result {
             Ok(()) => {
@@ -61,7 +66,10 @@ async fn main() -> Result<()> {
             Err(LinkError::Other(error)) => tracing::warn!(%error, "could not connect"),
         }
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = tokio::signal::ctrl_c() => {
+                client.finish_desktop().await;
+                return Ok(());
+            },
             _ = sleep(Duration::from_secs(delay)) => {}
         }
         delay = (delay * 2).min(30);
@@ -101,7 +109,10 @@ enum LinkError {
     Other(#[from] anyhow::Error),
 }
 
-async fn connect(endpoint: &str, code: &str) -> Result<(), LinkError> {
+async fn connect(endpoint: &str, code: &str, client: &ClientMcp) -> Result<(), LinkError> {
+    let cancel = CancellationToken::new();
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    let client = client.for_link(cancel.clone()).await;
     let mut request = endpoint
         .into_client_request()
         .map_err(|e| LinkError::Other(e.into()))?;
@@ -119,7 +130,6 @@ async fn connect(endpoint: &str, code: &str) -> Result<(), LinkError> {
         Err(error) => return Err(LinkError::Other(error.into())),
     };
     tracing::info!("connected");
-    let cancel = CancellationToken::new();
     let (outgoing, outgoing_rx) = mpsc::unbounded::<ServerJsonRpcMessage>();
     let (incoming_tx, incoming) = mpsc::unbounded::<ClientJsonRpcMessage>();
     let mut io_task = tokio::spawn(websocket_io(
@@ -128,8 +138,8 @@ async fn connect(endpoint: &str, code: &str) -> Result<(), LinkError> {
         incoming_tx,
         cancel.clone(),
     ));
-    let service = ClientMcp::default()
-        .serve((outgoing, incoming))
+    let service = client
+        .serve_with_ct((outgoing, incoming), cancel.clone())
         .await
         .map_err(|e| LinkError::Other(e.into()))?;
     tokio::select! {

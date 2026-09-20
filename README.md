@@ -3,8 +3,8 @@
 Connector lets an OAuth-authorized MCP controller operate Unix and Windows
 machines that are behind NAT. Each machine opens an outbound WebSocket to a
 central gateway; the controller can then discover connected machines, run
-fresh Bash or PowerShell 7 commands, apply structured file patches, and capture
-best-effort desktop screenshots.
+fresh Bash or PowerShell 7 commands, apply structured file patches, capture
+best-effort desktop screenshots, and control Windows or X11 desktop input.
 
 Connector is made of two Rust binaries:
 
@@ -97,14 +97,15 @@ The gateway exposes:
 
 | Tool | Purpose |
 | --- | --- |
-| `clients()` | List connected clients and their system and shell metadata. |
+| `clients()` | List connected clients, system/shell metadata, and desktop-input capability. |
 | `run(client, command, cwd?, timeout?, stdin?)` | Run one fresh process using the client's advertised shell and return combined output and its exit code. |
 | `apply_patch(client, patch, cwd?)` | Apply one Mu/Codex-style structured patch after complete preflight. |
 | `screenshot(client)` | Return a PNG or JPEG of the client's full desktop when a supported capture backend is available. |
+| `computer(client, actions)` | Execute a short mouse/keyboard action batch, then return a screenshot and execution summary. |
 
 Each online client also has a mode-`0600` local channel at
-`/run/connector/<name>.sock`. It exposes `run`, `apply_patch`, and `screenshot`
-as newline-delimited MCP JSON-RPC without OAuth; filesystem permissions are the
+`/run/connector/<name>.sock`. It exposes `run`, `apply_patch`, `screenshot`, and
+`computer` as newline-delimited MCP JSON-RPC without OAuth; filesystem permissions are the
 authorization boundary for this local interface.
 
 ## Key Designs
@@ -176,6 +177,59 @@ SQLite stores client credentials, OAuth clients and grants, authorization code
 hashes, and token hashes and lifecycle state. Connector does not persist
 commands, command output, patch contents, screenshots, live links, or MCP
 request mappings.
+
+### Desktop input
+
+`computer` supports Windows interactive desktops through native `SendInput`,
+and X11 through `xdotool` installed on the client. No additional Rust desktop
+or image-codec dependencies are required. Wayland input is not supported;
+Wayland screenshots remain available. `clients()` reports a `computer` object
+with `available`, and either `backend` or `reason`. This is a read-only probe
+at connection time, not a guarantee that a locked desktop, elevated Windows
+application, or later permission change will accept input.
+
+First capture a screenshot (`screenshot` or `computer` with `actions: []`).
+Use integer pixels in that full image, with `(0, 0)` at its top-left; Connector
+maps image scaling and the Windows virtual-desktop origin internally. Capture
+coverage stays best-effort: Windows uses the virtual desktop; X11 generally
+captures the current X screen, including its monitors. There is no monitor
+selection or combination of separate X screens. A coordinate action fails if
+the capture cannot be mapped to the desktop or the desktop geometry changed.
+
+```json
+{
+  "client": "workstation",
+  "actions": [
+    {"type": "click", "x": 420, "y": 310},
+    {"type": "key", "keys": ["CTRL", "A"]},
+    {"type": "type", "text": "Hello"},
+    {"type": "key", "keys": ["ENTER"]},
+    {"type": "wait", "ms": 200}
+  ]
+}
+```
+
+Actions are `move`, `click`, `scroll`, `drag`, `key`, `type`, and `wait`.
+Click supports `button` (`left`, `middle`, `right`) and `count` (1–3).
+Click, scroll, and drag accept `modifiers` (`ctrl`, `alt`, `shift`, `super`).
+Scroll specifies `x`, `y`, `direction` and `amount` in wheel steps (1–100).
+Drag specifies `from` and `to` objects with `x`/`y` and an optional `button`.
+`key` sends a chord of uppercase key names, while `type` enters literal Unicode
+text without modifying the clipboard. The tool schema lists supported keys.
+
+Batches have at most 32 actions and a 30-second execution budget checked
+between actions; each wait is at most 5 seconds and text is at most 8192 bytes.
+One desktop lock covers the entire batch and final capture, including across
+client reconnects. Keys and buttons are released within each action. Human
+input and GUI operations through `run` are not serialized by this lock.
+
+The complete batch is validated before input. Execution stops at the first
+failure and still attempts a final screenshot. Results report completed
+actions, image dimensions, and errors; the failing action may have partially
+executed. Screenshot failure does not undo input. Cancellation/disconnect
+stops subsequent actions while the current bounded action finishes cleanup.
+Never blindly replay an interrupted batch: inspect a fresh screenshot first.
+Client logs contain batch counts and status, not typed text or images.
 
 ## Development
 
