@@ -1,6 +1,8 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
+use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD};
+use futures::future::join_all;
 use rmcp::{
     ErrorData as McpError, RoleClient, RoleServer, ServerHandler,
     model::{
@@ -21,6 +23,7 @@ use crate::{
     apply_patch::{ApplyPatchArgs, ApplyPatchOutput, apply_patch},
     computer::{self, Capability, ComputerArgs, Desktop},
     execution::{DEFAULT_TIMEOUT, RunArgs, RunOutput, run_shell},
+    notes::{self, Notes},
     screenshot::Screenshot,
 };
 
@@ -49,15 +52,28 @@ pub struct ClientMcp {
     desktop: Arc<Mutex<Desktop>>,
     capability: Capability,
     disconnect: CancellationToken,
+    notes: Notes,
 }
 
 impl ClientMcp {
+    pub async fn new() -> Self {
+        let notes = Notes::initialize().await;
+        if let Some(error) = &notes.error {
+            tracing::warn!(%error, "client notes unavailable");
+        }
+        Self {
+            notes,
+            ..Self::default()
+        }
+    }
+
     pub async fn for_link(&self, disconnect: CancellationToken) -> Self {
         self.desktop.lock().await.invalidate();
         Self {
             desktop: self.desktop.clone(),
             capability: computer::capability().await,
             disconnect,
+            notes: self.notes.refresh().await,
         }
     }
 
@@ -75,14 +91,17 @@ pub struct ClientEnvironment {
     pub shell: String,
     #[serde(default)]
     pub computer: Capability,
+    #[serde(default)]
+    pub notes: Notes,
 }
 
 impl ClientEnvironment {
-    fn current(computer: Capability) -> Self {
+    fn current(computer: Capability, notes: Notes) -> Self {
         Self {
             system: std::env::consts::OS.into(),
             shell: current_shell().into(),
             computer,
+            notes,
         }
     }
 }
@@ -127,7 +146,7 @@ struct GatewayScreenshotArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct ScreenshotArgs {}
+struct EmptyArgs {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -152,6 +171,7 @@ struct ClientSummary {
     #[schemars(description = "Command shell reported by the client")]
     shell: String,
     computer: Capability,
+    notes: Notes,
 }
 
 impl GatewayMcp {
@@ -166,18 +186,24 @@ impl GatewayMcp {
     ) -> Result<CallToolResult, McpError> {
         match request.name.as_ref() {
             "clients" => {
-                let mut clients: Vec<_> = self
+                let snapshot: Vec<_> = self
                     .clients
                     .read()
                     .await
                     .iter()
-                    .map(|(name, client)| ClientSummary {
-                        name: name.clone(),
-                        system: client.environment.system.clone(),
-                        shell: client.environment.shell.clone(),
-                        computer: client.environment.computer.clone(),
-                    })
+                    .map(|(name, client)| (name.clone(), client.clone()))
                     .collect();
+                let mut clients = join_all(snapshot.into_iter().map(|(name, client)| async move {
+                    let notes = fetch_notes(&client).await;
+                    ClientSummary {
+                        name,
+                        system: client.environment.system,
+                        shell: client.environment.shell,
+                        computer: client.environment.computer,
+                        notes,
+                    }
+                }))
+                .await;
                 clients.sort_by(|a, b| a.name.cmp(&b.name));
                 Ok(CallToolResult::structured(json!(ClientsOutput { clients })))
             }
@@ -252,7 +278,13 @@ impl ChannelMcp {
 
 impl ServerHandler for GatewayMcp {
     fn get_info(&self) -> ServerInfo {
-        server_info("connector-gateway", "Control connected clients")
+        server_info(
+            "connector-gateway",
+            &format!(
+                "Control connected clients. Call clients() to discover each client's absolute notes.path and current notes.lines; the file is on that client, not the gateway.\n\n{}",
+                notes::INSTRUCTIONS
+            ),
+        )
     }
 
     async fn list_tools(
@@ -291,7 +323,16 @@ impl ServerHandler for GatewayMcp {
 
 impl ServerHandler for ChannelMcp {
     fn get_info(&self) -> ServerInfo {
-        server_info("connector-channel", "Control one connected client")
+        let notes = client_environment(&self.peer)
+            .map(|environment| environment.notes)
+            .unwrap_or_default();
+        server_info(
+            "connector-channel",
+            &format!(
+                "Control one connected client.\n\n{}",
+                local_notes_instructions(&notes)
+            ),
+        )
     }
 
     async fn list_tools(
@@ -332,7 +373,7 @@ impl ServerHandler for ChannelMcp {
                 relay_apply_patch(&self.peer, args).await.map(Into::into)
             }
             "screenshot" => {
-                let _: ScreenshotArgs = parse_args(request.arguments)?;
+                let _: EmptyArgs = parse_args(request.arguments)?;
                 relay_screenshot(&self.peer).await.map(Into::into)
             }
             "computer" => {
@@ -350,13 +391,19 @@ impl ServerHandler for ClientMcp {
     fn get_info(&self) -> ServerInfo {
         let mut info = server_info(
             "connector-client",
-            "Run fresh commands, apply patches, capture screenshots, and control this client's desktop",
+            &format!(
+                "Run fresh commands, apply patches, capture screenshots, and control this client's desktop.\n\n{}",
+                local_notes_instructions(&self.notes)
+            ),
         );
         let mut meta = JsonObject::new();
         meta.insert(
             CLIENT_ENVIRONMENT_META.into(),
-            serde_json::to_value(ClientEnvironment::current(self.capability.clone()))
-                .expect("environment serializes"),
+            serde_json::to_value(ClientEnvironment::current(
+                self.capability.clone(),
+                self.notes.clone(),
+            ))
+            .expect("environment serializes"),
         );
         info.meta = Some(MetaObject(meta));
         info
@@ -372,6 +419,7 @@ impl ServerHandler for ClientMcp {
             apply_patch_tool(false),
             screenshot_tool(false),
             computer_tool(false),
+            notes_metadata_tool(),
         ]))
     }
 
@@ -381,6 +429,7 @@ impl ServerHandler for ClientMcp {
             "apply_patch" => Some(apply_patch_tool(false)),
             "screenshot" => Some(screenshot_tool(false)),
             "computer" => Some(computer_tool(false)),
+            "notes_metadata" => Some(notes_metadata_tool()),
             _ => None,
         }
     }
@@ -390,8 +439,12 @@ impl ServerHandler for ClientMcp {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        if request.name == "notes_metadata" {
+            let _: EmptyArgs = parse_args(request.arguments)?;
+            return Ok(CallToolResult::structured(json!(self.notes.refresh().await)).into());
+        }
         if request.name == "screenshot" {
-            let _: ScreenshotArgs = parse_args(request.arguments)?;
+            let _: EmptyArgs = parse_args(request.arguments)?;
             let result = match self.desktop.lock().await.capture().await {
                 Ok(screenshot) => {
                     tracing::info!(
@@ -485,6 +538,52 @@ impl ServerHandler for ClientMcp {
         };
         Ok(result.into())
     }
+}
+
+async fn fetch_notes(client: &LiveClient) -> Notes {
+    let advertised = &client.environment.notes;
+    if advertised.path.is_none() {
+        return advertised.clone();
+    }
+    let result: anyhow::Result<Notes> = async {
+        let request = ClientRequest::CallToolRequest(CallToolRequest::new(
+            CallToolRequestParams::new("notes_metadata"),
+        ));
+        let response = client
+            .peer
+            .send_request_with_option(
+                request,
+                PeerRequestOptions::with_timeout(Duration::from_secs(3)),
+            )
+            .await?
+            .await_response()
+            .await?;
+        let ServerResult::CallToolResult(result) = response else {
+            anyhow::bail!("unexpected notes metadata response");
+        };
+        anyhow::ensure!(result.is_error != Some(true), "notes metadata query failed");
+        Ok(serde_json::from_value(
+            result
+                .structured_content
+                .context("missing notes metadata")?,
+        )?)
+    }
+    .await;
+    match result {
+        Ok(notes) => notes,
+        Err(error) => advertised.unavailable(format!("notes metadata unavailable: {error}")),
+    }
+}
+
+fn local_notes_instructions(notes: &Notes) -> String {
+    let location = match &notes.path {
+        Some(path) => format!(
+            "Persistent Markdown notes on this client (not the gateway): {}.",
+            serde_json::to_string(path).expect("path serializes"),
+        ),
+        None => "This client did not provide a notes path.".into(),
+    };
+    format!("{location}\n\n{}", notes::INSTRUCTIONS)
 }
 
 async fn relay_run(peer: &Peer<RoleClient>, args: RunArgs) -> Result<CallToolResult, McpError> {
@@ -622,7 +721,7 @@ fn clients_tool() -> Tool {
     secure(
         Tool::new(
             "clients",
-            "List connected clients with their system, shell, and detected desktop-input capability",
+            "List connected clients with their system, shell, desktop-input capability, and persistent notes path/current line count. Search relevant notes before making changes; maintain durable decisions using run and apply_patch.",
             empty_schema(),
         )
         .with_raw_output_schema(schema::<ClientsOutput>())
@@ -634,6 +733,16 @@ fn clients_tool() -> Tool {
                 .open_world(false),
         ),
     )
+}
+
+fn notes_metadata_tool() -> Tool {
+    Tool::new(
+        "notes_metadata",
+        "Report the persistent notes file's absolute path and current line count without reading its contents into the result; used by the gateway's client listing",
+        empty_schema(),
+    )
+    .with_raw_output_schema(schema::<Notes>())
+    .with_annotations(screenshot_annotations())
 }
 
 fn gateway_run_tool() -> Tool {
@@ -765,6 +874,7 @@ fn empty_schema() -> Arc<JsonObject> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::ServiceExt;
 
     #[test]
     fn exposes_run_tools_and_client_environment() {
@@ -775,20 +885,101 @@ mod tests {
 
         assert!(gateway.get_tool("screenshot").is_some());
         assert!(gateway.get_tool("computer").is_some());
+        assert!(gateway.get_tool("notes_metadata").is_none());
 
         let client = ClientMcp::default();
         assert!(client.get_tool("run").is_some());
         assert!(client.get_tool("apply_patch").is_some());
         assert!(client.get_tool("screenshot").is_some());
         assert!(client.get_tool("computer").is_some());
+        assert!(client.get_tool("notes_metadata").is_some());
         assert!(client.get_tool("bash").is_none());
         let info = client.get_info();
         let environment: ClientEnvironment =
             serde_json::from_value(info.meta.unwrap().0[CLIENT_ENVIRONMENT_META].clone()).unwrap();
         assert_eq!(
             environment,
-            ClientEnvironment::current(Capability::default())
+            ClientEnvironment::current(Capability::default(), Notes::default())
         );
+    }
+
+    #[tokio::test]
+    async fn client_listing_refreshes_notes_after_regular_edits() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".connector/NOTES.md");
+        let client = ClientMcp {
+            notes: Notes::create(path.clone()).await,
+            ..ClientMcp::default()
+        };
+        let (server_io, gateway_io) = tokio::io::duplex(16384);
+        let (server, link) = tokio::join!(client.serve(server_io), ().serve(gateway_io));
+        let server = server.unwrap();
+        let link = link.unwrap();
+        let channel = ChannelMcp::new(link.peer().clone());
+        assert!(channel.get_tool("notes_metadata").is_none());
+        let instructions = channel.get_info().instructions.unwrap();
+        assert!(instructions.contains(&serde_json::to_string(&path).unwrap()));
+        assert!(instructions.contains(notes::INSTRUCTIONS));
+        let clients = Arc::new(RwLock::new(HashMap::from([(
+            "test".into(),
+            LiveClient {
+                connection_id: "test".into(),
+                peer: link.peer().clone(),
+                environment: client_environment(link.peer()).unwrap(),
+                disconnect: CancellationToken::new(),
+            },
+        )])));
+        let gateway = GatewayMcp::new(clients);
+        assert!(
+            gateway
+                .get_info()
+                .instructions
+                .unwrap()
+                .contains(notes::INSTRUCTIONS)
+        );
+        let list = || {
+            gateway.invoke(
+                CallToolRequestParams::new("clients"),
+                CancellationToken::new(),
+            )
+        };
+        let initial = list().await.unwrap().structured_content.unwrap();
+        assert_eq!(
+            initial["clients"][0]["notes"],
+            json!({"path": path, "lines": 0})
+        );
+
+        let patch = gateway.invoke(
+            CallToolRequestParams::new("apply_patch").with_arguments(
+                json!({
+                    "client": "test",
+                    "cwd": home.path(),
+                    "patch": "*** Begin Patch\n*** Update File: .connector/NOTES.md\n@@\n+# Notes\n+\n+Keep project detail in project notes.\n*** End Patch\n"
+                }).as_object().unwrap().clone(),
+            ),
+            CancellationToken::new(),
+        ).await.unwrap();
+        assert_ne!(patch.is_error, Some(true));
+        let updated = list().await.unwrap().structured_content.unwrap();
+        assert_eq!(
+            updated["clients"][0]["notes"],
+            json!({"path": path, "lines": 3})
+        );
+
+        tokio::fs::write(&path, "External edit without a final newline")
+            .await
+            .unwrap();
+        assert_eq!(
+            list().await.unwrap().structured_content.unwrap()["clients"][0]["notes"]["lines"],
+            1
+        );
+        tokio::fs::remove_file(&path).await.unwrap();
+        let missing = list().await.unwrap().structured_content.unwrap();
+        assert_eq!(missing["clients"][0]["notes"]["path"], json!(path));
+        assert!(missing["clients"][0]["notes"]["lines"].is_null());
+        assert!(missing["clients"][0]["notes"]["error"].is_string());
+        link.cancel().await.unwrap();
+        server.cancel().await.unwrap();
     }
 
     #[test]
@@ -799,6 +990,11 @@ mod tests {
                 system: "linux".into(),
                 shell: "bash".into(),
                 computer: Capability::default(),
+                notes: Notes {
+                    path: Some("/home/alice/.connector/NOTES.md".into()),
+                    lines: Some(87),
+                    error: None,
+                },
             }],
         })
         .unwrap();
@@ -808,7 +1004,8 @@ mod tests {
                 "name": "build-server",
                 "system": "linux",
                 "shell": "bash",
-                "computer": {"available": false, "reason": "client did not advertise desktop input"}
+                "computer": {"available": false, "reason": "client did not advertise desktop input"},
+                "notes": {"path": "/home/alice/.connector/NOTES.md", "lines": 87}
             }]})
         );
     }

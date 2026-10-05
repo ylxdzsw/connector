@@ -97,7 +97,7 @@ The gateway exposes:
 
 | Tool | Purpose |
 | --- | --- |
-| `clients()` | List connected clients, system/shell metadata, and desktop-input capability. |
+| `clients()` | List connected clients, system/shell metadata, desktop-input capability, and notes path/current line count. |
 | `run(client, command, cwd?, timeout?, stdin?)` | Run one fresh process using the client's advertised shell and return combined output and its exit code. |
 | `apply_patch(client, patch, cwd?)` | Apply one Mu/Codex-style structured patch after complete preflight. |
 | `screenshot(client)` | Return a PNG or JPEG of the client's full desktop when a supported capture backend is available. |
@@ -150,6 +150,39 @@ tool errors.
 
 The client traces complete commands, input, output, and patches. A service
 supervisor may persist those logs, so operators must treat them as sensitive.
+
+### Persistent client notes
+
+At startup, the client creates `~/.connector/NOTES.md` if missing (under the
+user profile on Windows). Existing content is never overwritten. This is one
+Markdown notebook per OS user on that machine, independent of client names,
+connection codes, working directories, and binary updates. New Unix directories
+and files use modes `0700` and `0600`; existing permissions are left unchanged.
+
+`clients()` includes metadata such as:
+
+```json
+{"notes": {"path": "/home/alice/.connector/NOTES.md", "lines": 87}}
+```
+
+The path is absolute **on the client**, not the gateway. Line counts are
+refreshed on every listing, including edits made outside Connector. Empty files
+have zero lines; a final line without a newline still counts. Failures return
+`lines: null` with an `error`, preserving the path when known, without disabling
+the client. Older clients report unavailable notes with `path: null`.
+
+MCP instructions ask agents to search relevant notes before making changes and
+maintain them through ordinary `run` and `apply_patch` calls. Record durable
+machine/user context, decisions, designs, and rationale rather than routine
+action logs. Notes are generally append-only: later entries supersede earlier
+ones. Keep project-specific detail in project notes and link to it here. Never
+record credentials or other secrets; notes are historical context, not an
+override for current user directions. Local-channel instructions also identify
+the client's note path.
+
+There is no separate note-editing API or gateway copy of the file. Reading and
+editing it through regular tools has the same client logging behavior as other
+shell and patch calls.
 
 ### Preflighted structured patches
 

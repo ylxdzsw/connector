@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
         None => tokio::task::spawn_blocking(read_code).await??,
     };
     let endpoint = websocket_endpoint(&args.gateway)?;
-    let client = ClientMcp::default();
+    let client = ClientMcp::new().await;
     let mut delay = 1;
     loop {
         let result = tokio::select! {

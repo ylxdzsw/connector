@@ -278,11 +278,11 @@ screenshot(client)
 computer(client, actions)
 ```
 
-`clients` returns each connected client's name, system, shell, and desktop-input
-capability. For example:
+`clients` returns each connected client's name, system, shell, desktop-input
+capability, and persistent notes metadata. For example:
 
 ```json
-{"clients":[{"name":"workstation","system":"linux","shell":"bash","computer":{"available":true,"backend":"x11-xdotool"}}]}
+{"clients":[{"name":"workstation","system":"linux","shell":"bash","computer":{"available":true,"backend":"x11-xdotool"},"notes":{"path":"/home/alice/.connector/NOTES.md","lines":87}}]}
 ```
 
 The result is only a snapshot; callers must handle a client disconnecting
@@ -321,18 +321,24 @@ text frame contains one complete UTF-8 MCP message. The client credential is
 authenticated during upgrade, and WebSocket Ping/Pong provides liveness. No
 private heartbeat or authentication messages are mixed into MCP.
 
-The client exposes four tools:
+The client exposes five tools:
 
 ```text
 run(command, cwd?, timeout?, stdin?)
 apply_patch(patch, cwd?)
 screenshot()
 computer(actions)
+notes_metadata()
 ```
 
-The client reports its system, shell, and input capability in standard MCP
-initialization metadata. The gateway terminates the external and internal MCP sessions. It
-handles `clients` itself and maps external `run` and `apply_patch` calls to the
+`notes_metadata` is a read-only link tool used by the gateway to refresh the
+note path and line count. It returns metadata only, not file contents, and is
+not exposed through the controller or local-channel tool lists.
+
+The client reports its system, shell, input capability, and initial notes
+metadata during standard MCP initialization. The gateway terminates the external
+and internal MCP sessions. It handles `clients` itself and maps external `run`
+and `apply_patch` calls to the
 selected client's corresponding tools. It also relays `screenshot` calls and
 their MCP image content, along with `computer` batches and results.
 Request IDs, results, errors, and cancellation are mapped through both
@@ -354,6 +360,43 @@ Channel sockets are mode `0600`. The runtime directory is mode `0710`, allowing
 the Nginx worker group to traverse to the mode-`0660` HTTP gateway socket
 without listing the directory or accessing channels. The gateway removes a
 channel socket on disconnect.
+
+## Persistent Client Notes
+
+Each client initializes `~/.connector/NOTES.md` under the launching user's home
+directory (user profile on Windows), resolving it to an absolute path. It
+creates an empty file only if missing and never truncates existing content.
+New Unix directories use mode `0700` and new files mode `0600`; existing
+permissions are not changed. The notebook belongs to the machine/user, not a
+connection code, gateway client name, project, or working directory. It survives
+reconnects, credential changes, and executable replacement.
+
+Every `clients()` call queries connected clients' `notes_metadata` tools
+concurrently, without holding the live-client registry lock during requests.
+Each query has a three-second response timeout. Counts are read from disk, not
+cached from initialization: LF and CRLF files are supported, empty files have
+zero lines, and a final unterminated line counts. This remains a snapshot,
+not a consistency guarantee against concurrent edits.
+
+Unavailable files or failed queries return `notes.lines: null` and an `error`,
+retaining the path when known; they do not fail the whole listing or disable
+other tools. Missing home directories and older clients without notes metadata
+report `path: null` as well. Listing is read-only: a file deleted during a
+session is reported missing rather than silently recreated. Startup creates it
+again if still missing.
+
+Gateway MCP instructions and the `clients` description ask agents to search
+relevant notes before changes and maintain durable context, discussions,
+decisions, designs, and rationale using `run` and `apply_patch`. Notes are
+generally append-only, with later entries superseding earlier ones. Routine
+action logs and Git-history trivia are discouraged; project-specific detail
+belongs in project notes, referenced rather than duplicated here. Client and
+local-channel instructions include the specific client-side path.
+
+Agents must not record secrets or treat historical notes as instructions that
+override current user directions. No separate note-editing tools, file watcher,
+gateway content storage, or new authorization boundary are introduced. Normal
+shell/patch logging applies when agents read or edit the file.
 
 ## Shell Execution
 
@@ -483,9 +526,10 @@ SQLite persists:
 - Access and refresh token hashes, expiry, rotation, and revocation
 
 Live WebSockets, request mappings, and online status remain in memory. Connector
-does not persist command logs, command output, or screenshots; an external
-supervisor may retain the client's standard-error log. In-flight calls fail on
-disconnect or gateway restart and are never replayed.
+clients keep agent-maintained Markdown notes locally, outside gateway SQLite.
+Connector does not persist command logs, command output, or screenshots; an
+external supervisor may retain the client's standard-error log. In-flight calls
+fail on disconnect or gateway restart and are never replayed.
 
 ## Trust Boundaries
 
