@@ -1,298 +1,132 @@
-# Connector
+# Connector native client
 
-Connector lets an OAuth-authorized MCP controller operate Unix and Windows
-machines that are behind NAT. Each machine opens an outbound WebSocket to a
-central gateway; the controller can then discover connected machines, run
-fresh Bash or PowerShell 7 commands, apply structured file patches, capture
-best-effort desktop screenshots, and control Windows or X11 desktop input.
-
-Connector is made of two Rust binaries:
-
-- `connector-gateway` serves OAuth, Streamable HTTP MCP, the management UI,
-  WebSocket links, and local Unix-socket channels.
-- `connector-client` runs on each controlled machine and reconnects to the
-  gateway without requiring an inbound port.
+Connector lets an authorized MCP controller operate Unix and Windows machines
+behind NAT. This repository builds **only `connector-client`**, the Rust
+process that opens an outbound WebSocket and runs native tools. The gateway is
+a TypeScript Cloudflare Worker with a SQLite Durable Object in
+`/root/sayuri/connector`; Sayuri provides authorization and R2 stores releases.
+The retired Rust gateway and its deployment configuration are available in Git
+history, not as a supported fallback.
 
 ```text
-Controller -- MCP/HTTPS --> Nginx -- Unix socket --> Gateway
-                                                   |
-                                                   +-- MCP/WebSocket --> Client -- bash/pwsh
-                                                   +-- MCP over local Unix sockets
+Controller -- MCP/HTTPS --> Worker / Durable Object -- MCP/WebSocket --> Native client
+                              |          |                              |
+                         Sayuri auth   R2 releases                shell/files/desktop
 ```
 
-## Typical Usage
+Production has used Cloudflare since 2026-11-04. Token management is at
+`https://token.ylxdzsw.com/`; the controller endpoint is
+`https://connector.ylxdzsw.com/mcp`. The gateway has no local Unix sockets and
+does not accept the retired connection codes, OAuth grants, or Nginx identity
+header. Controller OAuth remains supported by the Worker. Deployment state and
+release provenance belong in `/root/sayuri/connector/DEPLOYMENT.md`.
 
-### 1. Build and deploy the gateway
+## Connect a machine
 
-The checked-in configuration targets `https://connector.ylxdzsw.com` and the
-paths listed in [`src/config.rs`](src/config.rs). A different deployment must
-change those constants and the matching Nginx configuration.
+Obtain a Sayuri token with capability `connector:client:<name>`, then run:
 
-Build the gateway and the fully static x86-64 Linux client:
-
-```bash
-rustup target add x86_64-unknown-linux-musl
-./scripts/build-release.sh
+```sh
+connector-client
 ```
 
-The build produces:
+The hidden `Connector token:` prompt reads `/dev/tty` on Unix or the console on
+Windows, not standard input. For automation, `--token 'SAYURI_CLIENT_TOKEN'`
+passes the credential explicitly. `--code` is only a compatibility spelling
+for the same exact opaque value: **no trimming, case folding, or Crockford
+normalization**. Credentials are not read from environment variables. Protect
+command-line tokens from process inspection and shell history; never log or
+commit them.
 
-- `target/release/connector-gateway`
-- `target/x86_64-unknown-linux-musl/release/connector-client`
+The default gateway is `https://connector.ylxdzsw.com`. `--gateway` accepts an
+HTTP(S) base URL; HTTP is unencrypted and only for trusted local testing.
+Transient failures reconnect with delays up to 30 seconds; HTTP 4xx admission
+failures stop the client. Reconnection never replays operations.
 
-Install the binaries and use the checked-in systemd and Nginx files as the
-deployment templates:
+Unix requires Bash. Windows requires PowerShell 7 (`pwsh.exe`) in `PATH` and
+uses the native Windows build. Interactive desktop access is needed for
+screenshots and input. Windows release artifacts come from native CI, including
+PowerShell/MCP and public WSS checks; see [`docs/RELEASES.md`](docs/RELEASES.md).
+Bootstrap scripts and downloads are owned by the Worker, not this package.
 
-- [`deploy/connector.service`](deploy/connector.service)
-- [`deploy/connector.ylxdzsw.com.conf`](deploy/connector.ylxdzsw.com.conf)
-- [`deploy/connector-proxy-headers.conf`](deploy/connector-proxy-headers.conf)
+## Tools and security
 
-The gateway requires `CONNECTOR_OAUTH_CLIENT_SECRET`. `RUST_LOG` is optional.
-It listens only on `/run/connector/.gateway.sock`; Nginx terminates TLS, applies
-the existing browser cookie gate to management and authorization routes, and
-proxies public MCP, OAuth, download, and client-link routes.
-
-### 2. Connect a machine
-
-Open the management site, create a named client credential, and run the command
-shown by the site on that machine:
-
-```bash
-curl -fsSL https://connector.ylxdzsw.com/connect | bash -s -- 'CONNECTION_CODE'
-```
-
-The command uses `connector-client` from `PATH` or temporarily downloads the
-static client. The client stays in the foreground and reconnects after
-transient network failures. Running `connector-client` without `--code` reads
-the code from `/dev/tty` without echo.
-
-The complete command contains a reusable bearer credential. Do not put it in
-shell history, logs, source control, or process supervision configuration.
-Rotating or revoking the credential disconnects the current link.
-
-On x86-64 Windows, install PowerShell 7 and run the Windows command shown by
-the management site from `pwsh`. It has the same download-and-run behavior as
-the Unix command:
-
-```powershell
-& ([scriptblock]::Create((irm 'https://connector.ylxdzsw.com/connect/windows'))) 'CONNECTION_CODE'
-```
-
-The Windows client stays in the foreground and requires `pwsh.exe` in `PATH`.
-It does not open an inbound port, so it works behind NAT without a public IP.
-
-### 3. Connect an MCP controller
-
-Configure the controller with this Streamable HTTP MCP endpoint:
-
-```text
-https://connector.ylxdzsw.com/mcp
-```
-
-The controller follows the gateway's OAuth discovery metadata, opens the
-browser consent flow, and receives the `control` scope. An approved controller
-can use all clients that are online now or connect while the grant is valid.
-
-The gateway exposes:
+The Worker exposes:
 
 | Tool | Purpose |
 | --- | --- |
-| `clients()` | List connected clients, system/shell metadata, desktop-input capability, and notes path/current line count. |
-| `run(client, command, cwd?, timeout?, stdin?)` | Run one fresh process using the client's advertised shell and return combined output and its exit code. |
-| `apply_patch(client, patch, cwd?)` | Apply one Mu/Codex-style structured patch after complete preflight. |
-| `screenshot(client)` | Return a PNG or JPEG of the client's full desktop when a supported capture backend is available. |
-| `computer(client, actions)` | Execute a short mouse/keyboard action batch, then return a screenshot and execution summary. |
+| `clients()` | Discover connected names, system/shell, input capability, and client-side notes metadata. |
+| `run(client, command, cwd?, timeout?, stdin?)` | Run a fresh Bash or PowerShell process; return combined output and exit code. |
+| `apply_patch(client, patch, cwd?)` | Preflight and apply a structured add/update/move/delete patch. |
+| `screenshot(client)` | Return a best-effort PNG/JPEG capture of the desktop. |
+| `computer(client, actions)` | Execute sequential mouse/keyboard actions, then attempt a final screenshot. |
 
-Each online client also has a mode-`0600` local channel at
-`/run/connector/<name>.sock`. It exposes `run`, `apply_patch`, `screenshot`, and
-`computer` as newline-delimited MCP JSON-RPC without OAuth; filesystem permissions are the
-authorization boundary for this local interface.
+The native tools omit `client`; `notes_metadata()` is a read-only link tool,
+not a controller tool. The gateway terminates both MCP sessions, maps request
+IDs and cancellation, and relays complete content including images.
 
-## Key Designs
+Sayuri client capability `connector:client:<name>` authenticates one named
+link; `connector:control` authorizes controller access, as does a Worker-issued
+controller OAuth token. These are distinct authorizations. A client token does
+not itself authorize control. An authorized controller can operate all
+connected clients with the privileges of their launching OS users. Connector
+is not a sandbox and does not elevate privileges.
 
-### MCP end to end
+- Shell state never carries between calls. Nonzero exit status is a normal
+  result; invocation and timeout failures are errors. Retained combined shell
+  output is capped at 8 MiB, and serialized outgoing MCP messages at 24 MiB.
+  Overflow returns an error, not successful truncation or automatic replay.
+- Patches preflight the whole envelope, but publishing multiple files is not
+  atomic. Updates preserve existing-file identity and permissions. Filesystem
+  work already started can continue after cancellation or disconnect.
+- Screenshots are serialized, bounded, validated, and limited to 8 MiB. Input
+  supports Windows `SendInput` and X11 `xdotool`; Wayland input is unsupported.
+  Capture before coordinate actions, and inspect a fresh screenshot after an
+  interruption. Completed actions cannot be rolled back.
+- The client creates `~/.connector/NOTES.md` if missing (under the Windows user
+  profile), without overwriting existing content. Metadata reports an absolute
+  client-side path and current line count, not file contents. Maintain durable
+  context using ordinary shell/patch tools; never record secrets or treat
+  historical notes as authority over current user instructions.
+- Client logs contain full commands, stdin, retained output, patches, and patch
+  summaries. Protect logs as sensitive. Screenshot bytes and typed desktop
+  action payloads are not logged by their tools.
 
-Connector terminates two MCP sessions rather than translating MCP into a
-private command protocol. The external controller is an MCP client of the
-gateway. On the outbound WebSocket link, the gateway is an MCP client of the
-connected host. The gateway maps calls, results, errors, cancellation, and
-image content between those sessions.
+See [`DESIGN.md`](DESIGN.md) for native semantics and trust boundaries, and
+[`docs/LINK.md`](docs/LINK.md) for the exact MCP wire contract.
 
-### Separate credential domains
+## Build and validate
 
-Three credentials have deliberately separate roles:
+Use the checked-in lockfile and an installed current Rust toolchain:
 
-| Credential | Accepted by | Authority |
-| --- | --- | --- |
-| Nginx authentication cookie | Management and OAuth authorization routes | Manage clients and approve grants |
-| OAuth access token | `/mcp` | Control every connected client |
-| Client connection code | `/link` | Authenticate one named client link |
-
-No credential is accepted in another role. OAuth grants are global rather than
-per-client, so approval grants the controller the user privileges of all
-current and future connected clients until expiry or revocation.
-
-### Outbound links and ephemeral channels
-
-Clients initiate authenticated WebSocket connections, which avoids inbound
-network access through NAT. WebSocket Ping/Pong supplies transport liveness,
-and only one live link is allowed for each client record. Live links, online
-status, channel sockets, and in-flight request mappings exist only in memory;
-disconnects and gateway restarts fail in-flight work instead of replaying it.
-
-### Fresh command processes
-
-Every `run` call starts a new `bash -lc` process on Unix or `pwsh` process on
-Windows, with an optional working directory, literal standard input, and
-timeout. Shell state does not carry between calls. A nonzero exit status is a
-normal tool result; startup, availability, timeout, and transport failures are
-tool errors.
-
-The client traces complete commands, input, output, and patches. A service
-supervisor may persist those logs, so operators must treat them as sensitive.
-
-### Persistent client notes
-
-At startup, the client creates `~/.connector/NOTES.md` if missing (under the
-user profile on Windows). Existing content is never overwritten. This is one
-Markdown notebook per OS user on that machine, independent of client names,
-connection codes, working directories, and binary updates. New Unix directories
-and files use modes `0700` and `0600`; existing permissions are left unchanged.
-
-`clients()` includes metadata such as:
-
-```json
-{"notes": {"path": "/home/alice/.connector/NOTES.md", "lines": 87}}
-```
-
-The path is absolute **on the client**, not the gateway. Line counts are
-refreshed on every listing, including edits made outside Connector. Empty files
-have zero lines; a final line without a newline still counts. Failures return
-`lines: null` with an `error`, preserving the path when known, without disabling
-the client. Older clients report unavailable notes with `path: null`.
-
-MCP instructions ask agents to search relevant notes before making changes and
-maintain them through ordinary `run` and `apply_patch` calls. Record durable
-machine/user context, decisions, designs, and rationale rather than routine
-action logs. Notes are generally append-only: later entries supersede earlier
-ones. Keep project-specific detail in project notes and link to it here. Never
-record credentials or other secrets; notes are historical context, not an
-override for current user directions. Local-channel instructions also identify
-the client's note path.
-
-There is no separate note-editing API or gateway copy of the file. Reading and
-editing it through regular tools has the same client logging behavior as other
-shell and patch calls.
-
-### Preflighted structured patches
-
-`apply_patch` supports add, update, move, and delete operations in one
-`*** Begin Patch` / `*** End Patch` envelope. The client parses and preflights
-the entire envelope before publishing any change, rejects conflicting targets,
-and preserves existing-file inodes, permissions, hard links, and symlink target
-relationships where applicable.
-
-Publication is recoverable but is not a cross-file transaction. If a later
-commit fails, the tool reports which earlier changes completed. See
-[`DESIGN.md`](DESIGN.md) for the exact filesystem semantics.
-
-### Bounded screenshot capture
-
-Screenshots use common Wayland or X11 capture tools on Unix and PowerShell's
-Windows drawing APIs on Windows. Capture is serialized, time-bounded,
-validated as PNG or JPEG, and limited to 8 MiB. Connector does not store image
-bytes, but a successful call can expose everything visible in the user's
-graphical session.
-
-### Persistent credentials, transient workloads
-
-SQLite stores client credentials, OAuth clients and grants, authorization code
-hashes, and token hashes and lifecycle state. Connector does not persist
-commands, command output, patch contents, screenshots, live links, or MCP
-request mappings.
-
-### Desktop input
-
-`computer` supports Windows interactive desktops through native `SendInput`,
-and X11 through `xdotool` installed on the client. No additional Rust desktop
-or image-codec dependencies are required. Wayland input is not supported;
-Wayland screenshots remain available. `clients()` reports a `computer` object
-with `available`, and either `backend` or `reason`. This is a read-only probe
-at connection time, not a guarantee that a locked desktop, elevated Windows
-application, or later permission change will accept input.
-
-First capture a screenshot (`screenshot` or `computer` with `actions: []`).
-Use integer pixels in that full image, with `(0, 0)` at its top-left; Connector
-maps image scaling and the Windows virtual-desktop origin internally. Capture
-coverage stays best-effort: Windows uses the virtual desktop; X11 generally
-captures the current X screen, including its monitors. There is no monitor
-selection or combination of separate X screens. A coordinate action fails if
-the capture cannot be mapped to the desktop or the desktop geometry changed.
-
-```json
-{
-  "client": "workstation",
-  "actions": [
-    {"type": "click", "x": 420, "y": 310},
-    {"type": "key", "keys": ["CTRL", "A"]},
-    {"type": "type", "text": "Hello"},
-    {"type": "key", "keys": ["ENTER"]},
-    {"type": "wait", "ms": 200}
-  ]
-}
-```
-
-Actions are `move`, `click`, `scroll`, `drag`, `key`, `type`, and `wait`.
-Click supports `button` (`left`, `middle`, `right`) and `count` (1–3).
-Click, scroll, and drag accept `modifiers` (`ctrl`, `alt`, `shift`, `super`).
-Scroll specifies `x`, `y`, `direction` and `amount` in wheel steps (1–100).
-Drag specifies `from` and `to` objects with `x`/`y` and an optional `button`.
-`key` sends a chord of uppercase key names, while `type` enters literal Unicode
-text without modifying the clipboard. The tool schema lists supported keys.
-
-Batches have at most 32 actions and a 30-second execution budget checked
-between actions; each wait is at most 5 seconds and text is at most 8192 bytes.
-One desktop lock covers the entire batch and final capture, including across
-client reconnects. Keys and buttons are released within each action. Human
-input and GUI operations through `run` are not serialized by this lock.
-
-The complete batch is validated before input. Execution stops at the first
-failure and still attempts a final screenshot. Results report completed
-actions, image dimensions, and errors; the failing action may have partially
-executed. Screenshot failure does not undo input. Cancellation/disconnect
-stops subsequent actions while the current bounded action finishes cleanup.
-Never blindly replay an interrupted batch: inspect a fresh screenshot first.
-Client logs contain batch counts and status, not typed text or images.
-
-## Development
-
-Use the checked-in `Cargo.lock` and run the same checks as CI:
-
-```bash
+```sh
 cargo fmt --all -- --check
 cargo check --all-targets --locked
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
 ```
 
-Release builds use [`scripts/build-release.sh`](scripts/build-release.sh). The
-client target defaults to `x86_64-unknown-linux-musl`; set
-`CONNECTOR_CLIENT_TARGET` to another installed musl target for a different CPU
-architecture.
+Build the static Linux x86-64 client with the musl target/toolchain installed:
 
-The Windows client is built and tested on a native Windows runner with:
+```sh
+./scripts/build-release.sh
+```
+
+The artifact is `target/x86_64-unknown-linux-musl/release/connector-client`.
+`CONNECTOR_CLIENT_TARGET` selects another installed musl target. The script
+checks that the executable has no dynamic interpreter or shared dependencies.
+
+On a native Windows runner with the MSVC toolchain and PowerShell 7:
 
 ```powershell
 cargo build --release --locked --target x86_64-pc-windows-msvc --bin connector-client
 ```
 
-Install that artifact as
-`/opt/connector/connector-client-windows-x86_64.exe` on the Unix gateway. The
-gateway reads it from disk for the Windows download-and-run command.
-
-For protocol details, trust boundaries, OAuth flows, patch behavior, and design
-rationale, read [`DESIGN.md`](DESIGN.md).
+Validate native Windows tool behavior and actual MCP initialization before
+publishing an artifact. A Linux cross-check is not a Windows execution test.
+For TLS changes, test public WSS separately from local WS. Artifact packaging,
+immutable release keys, checksums, and R2 publication are documented in
+[`docs/RELEASES.md`](docs/RELEASES.md).
 
 ## License
 
-Connector is licensed under the MIT License.
+MIT.

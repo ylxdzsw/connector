@@ -54,16 +54,48 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Check client
-        run: cargo check --locked --target x86_64-pc-windows-msvc --lib --bin connector-client
+        run: cargo check --locked --target x86_64-pc-windows-msvc --all-targets
       - name: Lint client
-        run: cargo clippy --locked --target x86_64-pc-windows-msvc --lib --bin connector-client -- -D warnings
+        run: cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets -- -D warnings
       - name: Test client
-        run: cargo test --locked --target x86_64-pc-windows-msvc --lib --bin connector-client
+        run: cargo test --locked --target x86_64-pc-windows-msvc --all-targets
       - name: Build release client
         run: cargo build --release --locked --target x86_64-pc-windows-msvc --bin connector-client
+      - name: Verify public WSS TLS and authentication boundary
+        shell: pwsh
+        run: |
+          $start = [Diagnostics.ProcessStartInfo]::new()
+          $start.FileName = (Resolve-Path 'target/x86_64-pc-windows-msvc/release/connector-client.exe').Path
+          $start.UseShellExecute = $false
+          $start.RedirectStandardOutput = $true
+          $start.RedirectStandardError = $true
+          $start.Environment['RUST_LOG'] = 'off'
+          $start.Environment['USERPROFILE'] = Join-Path $env:RUNNER_TEMP 'connector-smoke-profile'
+          $null = New-Item -ItemType Directory -Force $start.Environment['USERPROFILE']
+          $start.ArgumentList.Add('--gateway')
+          $start.ArgumentList.Add('https://connector.ylxdzsw.com')
+          $start.ArgumentList.Add('--token')
+          $start.ArgumentList.Add([guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N'))
+          $process = [Diagnostics.Process]::Start($start)
+          $stderr = $process.StandardError.ReadToEndAsync()
+          if (-not $process.WaitForExit(30000)) { $process.Kill($true); throw 'Public WSS check timed out' }
+          $errorText = $stderr.GetAwaiter().GetResult()
+          if ($process.ExitCode -eq 0 -or $errorText -notmatch 'gateway rejected the connection \(401 Unauthorized\)') {
+            throw 'Expected authenticated public WSS endpoint to reject the unregistered fixture credential'
+          }
+          Write-Output 'Public WSS TLS and credential rejection passed'
+      - name: Record artifact provenance
+        shell: pwsh
+        run: |
+          $file = 'target/x86_64-pc-windows-msvc/release/connector-client.exe'
+          $hash = (Get-FileHash -Algorithm SHA256 $file).Hash.ToLowerInvariant()
+          @{ commit = $env:GITHUB_SHA; target = 'x86_64-pc-windows-msvc'; sha256 = $hash } |
+            ConvertTo-Json | Set-Content -Encoding utf8 'target/x86_64-pc-windows-msvc/release/provenance.json'
       - name: Upload release client
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: connector-client-windows-x86_64
-          path: target/x86_64-pc-windows-msvc/release/connector-client.exe
+          path: |
+            target/x86_64-pc-windows-msvc/release/connector-client.exe
+            target/x86_64-pc-windows-msvc/release/provenance.json
           if-no-files-found: error

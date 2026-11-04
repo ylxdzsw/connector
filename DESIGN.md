@@ -1,402 +1,119 @@
-# Connector Design
+# Connector design
 
-## Goal
+## Architecture and ownership
 
-Connector lets an authenticated MCP controller run non-persistent shell
-commands on Unix and Windows clients behind NAT.
-
-```text
-Controller -- MCP/HTTPS --> Nginx -- Unix socket --> Gateway -- MCP/WebSocket --> Client -- bash/pwsh
-                                                   |
-                                                   +-- newline JSON-RPC on Unix sockets
-```
-
-Clients support fresh shell commands, best-effort desktop screenshots, and
-batched Windows/X11 mouse and keyboard input. Persistent terminals are future
-work. The gateway remains Unix-only.
-
-## Participants
-
-- **Client**: a program started by the script served by the gateway. It opens
-  an outbound link, receives MCP tool calls, and executes its advertised shell.
-- **Gateway**: `connector.ylxdzsw.com`, running behind Nginx on this server. It
-  accepts HTTP only on a private Unix socket, authenticates participants,
-  relays MCP through NAT, serves the connection script, and exposes local Unix
-  sockets.
-- **Controller**: an MCP client such as Mu or ChatGPT. Once authorized, it can
-  control every connected client.
-- **Channel**: a named route to one connected client. A channel is not a
-  persistent shell.
-
-## Authorization Policy
-
-Controllers are authorized for Connector as a whole, not for individual
-clients. An authenticated controller can list and control all clients that are
-connected now or connect while its grant remains valid. V1 has no per-user,
-per-controller, or per-client ACL.
-
-The public MCP resource is:
+This Rust package contains only the native Unix/Windows `connector-client`.
+The gateway is the TypeScript Worker / SQLite Durable Object project at
+`/root/sayuri/connector`. Sayuri owns token authorization; the Worker owns
+controller MCP/OAuth, link coordination, bootstrap routes, and R2 downloads.
+The retired Rust gateway, SQLite credential issuer, Nginx/systemd deployment,
+and local Unix-socket channels exist only in Git history.
 
 ```text
-https://connector.ylxdzsw.com/mcp
+Controller -- MCP/HTTPS --> Worker / Durable Object -- MCP/WebSocket --> Native client
+                              |          |                              |
+                         Sayuri auth   R2 releases                shell/files/desktop
 ```
 
-The OAuth scope `control` grants access to all controller tools.
-
-## Credentials
-
-Three credentials have separate purposes:
-
-| Credential | Presented by | Accepted by | Purpose |
-| --- | --- | --- | --- |
-| Nginx cookie | Browser | Nginx | Authenticate the human |
-| OAuth token | Controller | Gateway `/mcp` | Authorize all client control |
-| Connection code | Client | Gateway `/link` | Authenticate one named client |
-
-A credential is never accepted in another role.
-
-### Client credentials
-
-The Nginx-authenticated management site asks for a client name and a validity
-period in days. It creates:
-
-```text
-name
-code
-expires_at
-```
-
-`expires_at` is computed from the requested number of days. `name` is the
-stable client ID and must be safe as a Unix socket filename.
-
-The gateway generates an eight-character, case-insensitive Crockford Base32
-connection code. The code contains 40 bits of entropy, identifies the client
-record by itself, and is shown when created. The gateway stores the normalized
-code directly and throttles failed `/link` authentication attempts. V1 accepts
-the resulting disclosure and brute-force tradeoffs.
-
-The code is reusable until expiry or revocation. Only one live connection is
-allowed for its client record. A second connection is rejected. Disconnect
-removes online state but retains the credential.
-
-The management site can extend a non-revoked credential without changing its
-connection code. Days are added to its current expiration, or from the current
-time when the credential has already expired.
-
-It can also rotate a client code. Rotation replaces the stored code, invalidates
-the previous code, disconnects the live link if present, and shows the new
-copyable connection command. Rotation of a revoked client also clears its
-revocation state; it does not extend an expired client credential. The client
-must run the new command to reconnect.
-
-After creating a credential, the management site displays one copyable command
-containing its connection code:
-
-```bash
-curl -fsSL https://connector.ylxdzsw.com/connect | bash -s -- '<connection-code>'
-```
-
-The script uses an executable `connector-client` already available in `PATH`,
-or otherwise downloads a temporary copy and runs it. The script passes the
-connection code to the binary as `--code`. The code is a reusable bearer
-credential and the displayed command must be treated as secret. For manual use
-without a command argument, the binary still prompts for the code and reads it
-from `/dev/tty` without echo.
-
-The distributed Linux client is built against musl as a fully static
-executable. It has no glibc or shared-library dependency, although a separate
-artifact is still required for each CPU architecture.
-
-The x86-64 Windows client is built with the MSVC Rust target and requires
-PowerShell 7 (`pwsh.exe`). The management site displays a one-command
-PowerShell bootstrap that downloads a temporary executable and runs it with
-the connection code, matching the Unix download-and-run flow.
-
-The client sends the code as a bearer credential to `/link`. The gateway looks
-it up directly, obtains the corresponding name, and then upgrades the
-connection to WebSocket.
-
-### Controller credentials
-
-The gateway is its own OAuth 2.1 authorization server and resource server. It
-issues short-lived opaque access tokens and rotating refresh tokens. Stored
-authorization codes and tokens are hashed.
-
-ChatGPT is a predefined confidential OAuth client. Its client ID and exact
-redirect URI are fixed in the gateway; only its secret is read from the
-environment, and only the secret hash is persisted. Its credentials are entered
-when the custom connector is created. V1 does not implement dynamic client
-registration or Client ID Metadata Documents.
-
-## OAuth Discovery
-
-The gateway publishes protected-resource metadata:
-
-```text
-GET /.well-known/oauth-protected-resource
-```
-
-```json
-{
-  "resource": "https://connector.ylxdzsw.com/mcp",
-  "authorization_servers": ["https://connector.ylxdzsw.com"],
-  "scopes_supported": ["control"]
-}
-```
-
-It also publishes authorization-server metadata:
-
-```text
-GET /.well-known/oauth-authorization-server
-```
-
-```json
-{
-  "issuer": "https://connector.ylxdzsw.com",
-  "authorization_endpoint": "https://connector.ylxdzsw.com/oauth/authorize",
-  "token_endpoint": "https://connector.ylxdzsw.com/oauth/token",
-  "revocation_endpoint": "https://connector.ylxdzsw.com/oauth/revoke",
-  "response_types_supported": ["code"],
-  "grant_types_supported": ["authorization_code", "refresh_token"],
-  "code_challenge_methods_supported": ["S256"],
-  "token_endpoint_auth_methods_supported": ["client_secret_basic"],
-  "scopes_supported": ["control", "offline_access"],
-  "authorization_response_iss_parameter_supported": true
-}
-```
-
-## OAuth Workflow
-
-### 1. Challenge and discovery
-
-An unauthenticated MCP request receives:
-
-```http
-HTTP/1.1 401 Unauthorized
-WWW-Authenticate: Bearer resource_metadata="https://connector.ylxdzsw.com/.well-known/oauth-protected-resource", scope="control"
-```
-
-ChatGPT reads the protected-resource and authorization-server metadata.
-
-### 2. Authorization request
-
-ChatGPT opens `/oauth/authorize` in the user's browser with a request such as:
-
-```text
-response_type=code
-client_id=<registered ChatGPT client>
-redirect_uri=<registered ChatGPT callback>
-scope=control
-resource=https://connector.ylxdzsw.com/mcp
-code_challenge=<PKCE challenge>
-code_challenge_method=S256
-state=<ChatGPT state>
-```
-
-Nginx requires its existing authentication cookie on this endpoint. The
-current cookie gate has one identity, so Nginx forwards the constant subject
-`owner` in a trusted header. If the gate becomes multi-user later, this may be
-replaced by a stable user ID. Nginx must remove any inbound copy of the header
-before setting it.
-
-The gateway validates the OAuth client, exact redirect URI, scope, resource,
-and PKCE method. It then asks the user to approve this grant:
-
-```text
-Allow this controller to run shell commands, apply structured file patches,
-capture graphical desktop screenshots, and control the mouse and keyboard on
-all current and future connected clients until access is revoked?
-```
-
-The consent POST uses CSRF protection. Consent is recorded for the authenticated
-subject, OAuth client, and scopes.
-
-### 3. Authorization code
-
-After approval, the gateway creates a short-lived, single-use code bound to:
-
-```text
-subject
-oauth_client_id
-redirect_uri
-resource
-scopes
-code_challenge
-expires_at
-```
-
-It redirects to the registered callback with `code`, the original `state`, and
-an `iss` parameter equal to the advertised issuer.
-
-### 4. Token exchange
-
-ChatGPT authenticates with HTTP Basic and exchanges the code at `/oauth/token`.
-The request repeats the redirect URI and resource and supplies the PKCE
-verifier. The gateway validates all bindings and atomically consumes the code.
-
-The response contains a short-lived access token and a rotating refresh token.
-`offline_access` remains accepted and advertised as a protocol-level scope, but
-refresh-token issuance does not depend on ChatGPT requesting it. The access
-token is bound to the controller subject, OAuth client, `control` scope, and
-Connector resource.
-
-### 5. MCP requests
-
-The controller presents the access token on every request:
-
-```http
-Authorization: Bearer <access-token>
-```
-
-The gateway checks the token hash, expiry, revocation state, resource, scope,
-and OAuth client before dispatching a tool call.
-
-### 6. Refresh and revocation
-
-ChatGPT may exchange a refresh token for a new access token without the Nginx
-cookie. Refresh tokens rotate on use. Reuse of an already rotated token revokes
-that grant.
-
-The management site can revoke a controller grant or a client credential.
-Controller revocation invalidates its access and refresh tokens. Client
-revocation closes that client's link. The two operations are independent.
-
-## MCP Interfaces
-
-### Controller to gateway
-
-The gateway exposes standard MCP Streamable HTTP at `/mcp`. It is the MCP
-server; the controller is the MCP client.
-
-The gateway exposes five tools:
-
-```text
-clients()
-run(client, command, cwd?, timeout?, stdin?)
-apply_patch(client, patch, cwd?)
-screenshot(client)
-computer(client, actions)
-```
-
-`clients` returns each connected client's name, system, shell, desktop-input
-capability, and persistent notes metadata. For example:
-
-```json
-{"clients":[{"name":"workstation","system":"linux","shell":"bash","computer":{"available":true,"backend":"x11-xdotool"},"notes":{"path":"/home/alice/.connector/NOTES.md","lines":87}}]}
-```
-
-The result is only a snapshot; callers must handle a client disconnecting
-before a later `run` call.
-
-`run` selects a client by name and relays one non-persistent command to that
-client's advertised shell. An unknown or disconnected client produces a
-tool-level availability error.
-
-`apply_patch` selects a client by name and relays one Mu/Codex-style structured
-patch. The client preflights all add, update, move, and delete operations before
-publishing changes. Relative paths resolve from the requested working directory
-or the client process's current directory.
-
-`screenshot` asks a client to capture its full graphical desktop and returns a
-standard MCP PNG or JPEG image. The tool is always present; a headless client,
-an unsupported platform, or a client without a usable capture program returns
-a tool-level availability error.
-
-`computer` executes a short sequential input batch and always attempts one
-final screenshot. An empty batch only captures. Input capability is probed
-without sending events at each link initialization and advertised in client
-environment metadata. Unavailable input reports `available: false` and a
-`reason`; older clients without this metadata default to unavailable. This
-snapshot is advisory; every input call checks current desktop access.
-
-All tools declare OAuth security metadata requiring the `control` scope.
-
-### Gateway to client
-
-The client opens a WebSocket to the gateway, but MCP roles follow message
-direction: the gateway is the MCP client and the client is the MCP server.
-
-The link carries exact MCP JSON-RPC over a custom WebSocket transport. Each
-text frame contains one complete UTF-8 MCP message. The client credential is
-authenticated during upgrade, and WebSocket Ping/Pong provides liveness. No
-private heartbeat or authentication messages are mixed into MCP.
-
-The client exposes five tools:
-
-```text
-run(command, cwd?, timeout?, stdin?)
-apply_patch(patch, cwd?)
-screenshot()
-computer(actions)
-notes_metadata()
-```
-
-`notes_metadata` is a read-only link tool used by the gateway to refresh the
-note path and line count. It returns metadata only, not file contents, and is
-not exposed through the controller or local-channel tool lists.
-
-The client reports its system, shell, input capability, and initial notes
-metadata during standard MCP initialization. The gateway terminates the external
-and internal MCP sessions. It handles `clients` itself and maps external `run`
-and `apply_patch` calls to the
-selected client's corresponding tools. It also relays `screenshot` calls and
-their MCP image content, along with `computer` batches and results.
-Request IDs, results, errors, and cancellation are mapped through both
-sessions. A client that omits its environment metadata or provides malformed
-values is rejected during link initialization.
-
-### Local Unix socket
-
-While a client is connected, the gateway listens on:
-
-```text
-/run/connector/<name>.sock
-```
-
-The socket exposes that client's `run(command, cwd?, timeout?, stdin?)`,
-`apply_patch(patch, cwd?)`, `screenshot()`, and `computer(actions)` tools using
-newline-delimited MCP JSON-RPC.
-Channel sockets are mode `0600`. The runtime directory is mode `0710`, allowing
-the Nginx worker group to traverse to the mode-`0660` HTTP gateway socket
-without listing the directory or accessing channels. The gateway removes a
-channel socket on disconnect.
-
-## Persistent Client Notes
-
-Each client initializes `~/.connector/NOTES.md` under the launching user's home
-directory (user profile on Windows), resolving it to an absolute path. It
-creates an empty file only if missing and never truncates existing content.
-New Unix directories use mode `0700` and new files mode `0600`; existing
-permissions are not changed. The notebook belongs to the machine/user, not a
-connection code, gateway client name, project, or working directory. It survives
-reconnects, credential changes, and executable replacement.
-
-Every `clients()` call queries connected clients' `notes_metadata` tools
-concurrently, without holding the live-client registry lock during requests.
-Each query has a three-second response timeout. Counts are read from disk, not
-cached from initialization: LF and CRLF files are supported, empty files have
-zero lines, and a final unterminated line counts. This remains a snapshot,
-not a consistency guarantee against concurrent edits.
-
-Unavailable files or failed queries return `notes.lines: null` and an `error`,
-retaining the path when known; they do not fail the whole listing or disable
-other tools. Missing home directories and older clients without notes metadata
-report `path: null` as well. Listing is read-only: a file deleted during a
-session is reported missing rather than silently recreated. Startup creates it
-again if still missing.
-
-Gateway MCP instructions and the `clients` description ask agents to search
-relevant notes before changes and maintain durable context, discussions,
-decisions, designs, and rationale using `run` and `apply_patch`. Notes are
-generally append-only, with later entries superseding earlier ones. Routine
-action logs and Git-history trivia are discouraged; project-specific detail
-belongs in project notes, referenced rather than duplicated here. Client and
-local-channel instructions include the specific client-side path.
-
-Agents must not record secrets or treat historical notes as instructions that
-override current user directions. No separate note-editing tools, file watcher,
-gateway content storage, or new authorization boundary are introduced. Normal
-shell/patch logging applies when agents read or edit the file.
+The external controller is an MCP client of the gateway. On the outbound
+WebSocket, the gateway is the MCP client and the native process the MCP server.
+The gateway terminates both sessions, maps IDs, results, errors, cancellation,
+and complete image content, and fails pending calls on disconnect. It never
+replays operations. Every link initializes a fresh MCP session.
+
+The native tools are `run`, `apply_patch`, `screenshot`, `computer`, and
+`notes_metadata`. The Worker adds the `client` selector for controller calls
+and implements `clients()` itself; `notes_metadata` remains link-only. See
+[`docs/LINK.md`](docs/LINK.md) for initialization, supported protocol versions,
+metadata, and limits. Native SDK protocol negotiation and cancellation remain
+standard MCP; there is no private command or heartbeat protocol.
+
+## Credentials and trust
+
+Sayuri tokens are opaque, case-sensitive bearers. The Worker requires
+`connector:client:<name>` on `/link` and `connector:control` for direct
+controller access on `/mcp`; Worker-issued controller OAuth tokens are also
+supported. Client identity comes from the authorized capability, not a name
+asserted by the native process. Client and controller capabilities are distinct
+authorizations in the same token system; presenting a token at the other
+endpoint must not give it extra authority. Expiry, revocation, and OAuth
+lifecycle policy belong to Sayuri and the Worker, not the native package.
+
+`--token` is the canonical native option; `--code` is an exact opaque alias
+only, without the retired Crockford normalization. Without either, the client
+prompts without echo on `/dev/tty` (Unix) or the Windows console. It never reads
+credentials from environment variables or stdin. Tokens must be nonempty and
+valid HTTP bearer header values without whitespace. Invalid tokens are
+rejected, not transformed; errors do not include their value. Command-line
+credentials can be visible in process inspection and shell history.
+
+`--gateway` defaults to `https://connector.ylxdzsw.com` and maps HTTP(S) to
+WS(S) `/link`. Rustls validates certificates using the explicitly installed
+ring provider. HTTP is suitable only for trusted local testing. Authentication
+occurs during WebSocket upgrade. Ping/Pong supplies transport liveness; each
+text message contains one complete MCP JSON-RPC message. Admission HTTP 4xx
+is terminal; transient failures reconnect with bounded exponential backoff.
+
+A native client trusts the gateway to send authorized commands; it does not
+identify the originating controller. Gateway compromise or an active
+controller grant permits commands on connected clients. A stolen client token
+can permit impersonating that named client, receiving intended commands, and
+forging results, but does not itself grant controller access. There are no
+Nginx identity-header or local-socket authorization bypasses.
+
+Tools run as the launching OS user, without elevation or isolation. Shell
+access grants all that user's privileges, and desktop tools can expose private
+content or interact with other applications. Treat controllers and gateway
+operators accordingly. Native command/patch logs are sensitive even though
+the gateway does not need to persist their content. No credentials belong in
+logs, committed files, or client notes.
+
+## Limits, cancellation, and state
+
+Every outgoing native MCP message is limited to 24 MiB of complete serialized
+UTF-8 JSON. An oversized tool result becomes a small `isError: true` result
+with the original request ID; partial JSON is never sent. If the replacement
+cannot fit, or a non-tool message is oversized, the link closes. Cloudflare's
+receive limit is 32 MiB. These per-message caps are not a global memory or
+backpressure policy; the Worker separately bounds requests and pending work.
+
+Disconnect cancels the link's MCP service. Cancellation can stop awaiting an
+operation but cannot undo side effects. Unix shell timeout/cancellation uses
+process-group cleanup; Windows uses child-process cleanup. Filesystem commits
+already started and bounded desktop cleanup can outlive their MCP call.
+Always inspect effects before a deliberate retry. No durable command queue or
+automatic replay is introduced.
+
+The native client keeps no credential database or controller grants. Live MCP
+requests and screenshot-to-input geometry are transient. Geometry is
+invalidated on reconnect after outstanding desktop work finishes. Persistent
+native state consists of agent-maintained local notes and the intended effects
+of tool calls; external supervisors may retain standard-error logs.
+
+## Persistent client notes
+
+Startup initializes `~/.connector/NOTES.md` under the launching user's home
+(user profile on Windows), resolving an absolute path. It creates an empty
+file only when missing, never truncating existing content. New Unix directories
+and files use modes `0700` and `0600`; existing permissions remain unchanged.
+The notebook belongs to the machine/user, not a token, gateway name, project,
+or working directory. It survives reconnection and executable replacement.
+
+Initialization advertises metadata, and `notes_metadata` refreshes path/line
+count from disk without returning content. LF and CRLF work; empty files have
+zero lines and a final unterminated line counts. Missing/unavailable files
+report nullable counts and an error, preserving a known path; refresh never
+recreates a deleted file. The Worker queries metadata for each `clients()`
+listing, with bounded concurrency and per-query timeouts, without letting one
+failed query disable the listing. This is a snapshot, not an edit lock.
+
+MCP instructions ask agents to search relevant notes and maintain durable
+context, discussions, decisions, designs, and rationale using `run` and
+`apply_patch`. Notes are generally append-only; later entries supersede earlier
+ones. Routine action logs and Git-history trivia are discouraged. Keep project
+specifics in project notes and reference them here. Never record secrets or
+treat historical notes as authority over current user directions. Reading and
+editing notes uses ordinary shell/patch logging and authorization.
 
 ## Shell Execution
 
@@ -409,15 +126,22 @@ Windows command text is written to a temporary `.ps1` and run with PowerShell
 profiles and interactive prompts disabled. This keeps standard input available
 for the tool call and avoids Windows command-line quoting and length limits.
 
+Retained combined output is capped at 8 MiB of raw bytes. Excess is drained
+until completion or timeout; overflow discards the output and returns a tool
+error with the exit code. Commands may already have changed state. The 24 MiB
+serialized MCP limit can also reject a result below this raw cap because JSON
+escaping and text/structured duplication expand it. Neither case triggers a
+replay.
+
 Before execution, the client logs the command, working directory, timeout, and
 full standard input to standard error through its tracing subscriber. After
-execution it logs the full combined standard output and error plus the exit
+execution it logs the retained combined standard output and error plus the exit
 code. The two records carry the MCP request ID for correlation. Operators must
 protect client process logs because commands, input, and output may contain
 sensitive data.
 
 The result contains combined command output and the exit code. A nonzero exit
-code is a normal tool result. MCP errors are reserved for invocation failures.
+code is a normal tool result. Invocation failures and timeouts are tool errors.
 Mu's `title` and `risk` fields are omitted because they are controller UI and
 policy metadata rather than execution inputs.
 
@@ -435,6 +159,11 @@ through a symlink edits its regular-file target; moving or deleting a symlink
 acts on the link. Existing-file updates preserve the inode, permissions, hard
 links, and symlink target relationship, use an advisory lock, and keep a
 recoverable sibling backup while writing.
+
+Publication is recoverable, not a cross-file transaction. A later commit
+failure reports earlier completed changes. Patch work runs through
+`spawn_blocking`; cancellation or disconnect cannot stop filesystem work that
+has already begun. Inspect affected paths after an interrupted call.
 
 The client logs the full patch, working directory, result summary, and failures
 to standard error. Patch content and paths may therefore be persisted by the
@@ -469,8 +198,8 @@ protected accordingly.
 
 ## Desktop Input
 
-`computer(client, actions)` exposes `move`, `click`, `scroll`, `drag`, `key`,
-`type`, and `wait`. The linked client/local channel omits `client`. Batches
+`computer(actions)` exposes `move`, `click`, `scroll`, `drag`, `key`,
+`type`, and `wait`. Batches
 contain at most 32 actions; click count is 1–3, scroll amount is 1–100 wheel
 steps, key chords contain 1–8 named keys, literal text is at most 8192 UTF-8
 bytes with no NUL, and each wait is at most 5000 ms. There is a 30-second batch
@@ -486,7 +215,7 @@ geometry is checked before and after capture, and again before actions;
 changed geometry fails input and the final capture supplies a new observation.
 This does not detect ordinary UI changes or make stale screenshots safe.
 Windows retains virtual-desktop coverage, including negative native origins;
-X11 retains backend-dependent full-X-screen capture. V1 has no per-monitor
+X11 retains backend-dependent full-X-screen capture. There is no per-monitor
 selection, frame IDs, separate-X-screen stitching, or Wayland input.
 
 Windows uses direct user32 FFI and `SendInput`; it does not elevate, bypass
@@ -512,150 +241,23 @@ still change the desktop while this lock is held.
 Normal Ctrl-C shutdown waits for pending desktop cleanup before exiting.
 
 Logs record batch counts and status, not action payloads or typed text.
-Existing OAuth `control` and local socket authorization apply unchanged;
-desktop input is not a security sandbox alongside unrestricted shell access.
+Desktop input uses the same controller authorization as shell access and is
+not a security sandbox alongside unrestricted shell access.
 
-## State
+## Releases and verification
 
-SQLite persists:
+Linux release builds use `scripts/build-release.sh` and an installed musl
+Rust target/toolchain; the resulting client is checked for static linkage.
+Windows builds require a native MSVC CI runner with PowerShell 7. Its native
+MCP/PowerShell and public WSS checks must pass before publishing the CI artifact;
+Linux cross-compilation alone does not establish runtime correctness. R2 packages use immutable
+versioned artifact keys and SHA-256 manifests, with the mutable stable pointer
+published last. See [`docs/RELEASES.md`](docs/RELEASES.md).
 
-- Client connection codes and expiry
-- Registered OAuth clients
-- Consent grants
-- Authorization code hashes and bindings
-- Access and refresh token hashes, expiry, rotation, and revocation
-
-Live WebSockets, request mappings, and online status remain in memory. Connector
-clients keep agent-maintained Markdown notes locally, outside gateway SQLite.
-Connector does not persist command logs, command output, or screenshots; an
-external supervisor may retain the client's standard-error log. In-flight calls
-fail on disconnect or gateway restart and are never replayed.
-
-## Trust Boundaries
-
-### Browser to Nginx
-
-The Nginx cookie establishes the single `owner` identity. Nginx alone validates
-it. The owner can provision clients and approve controller access to all
-clients.
-
-### Nginx to gateway
-
-The gateway accepts HTTP only through a mode-`0660` Unix socket in a directory
-searchable by the Nginx worker group. It trusts Nginx's identity header only on
-management and authorization routes. Nginx strips client-supplied identity
-headers. OAuth discovery, token, MCP, and client-link routes do not accept the
-Nginx identity header as authentication.
-
-### Controller to gateway
-
-The OAuth client secret identifies registered controller software. PKCE binds
-the authorization response to the initiating controller. The access token
-authorizes the resulting controller session. A refresh token grants durable
-control until expiry or revocation and must never appear in URLs or logs.
-
-### Client to gateway
-
-The connection code authenticates one named client link. It grants no
-controller or management access. If disclosed, however, it can be used to
-impersonate that client while the genuine client is disconnected, receive
-commands intended for it, forge results, or occupy its connection slot. It
-cannot create other client records. A connected client trusts the gateway to
-send authorized calls and does not know which controller originated them.
-
-### Gateway to clients
-
-The gateway is the central authority and can command every connected client.
-Compromise of the gateway, Nginx authentication path, or an active controller
-grant permits commands on all clients.
-
-### Client to operating system
-
-Shell and screenshot capture programs run as the user that launched the
-client. Connector does not elevate privileges. OAuth control therefore grants
-all privileges available to that user and can expose everything visible in
-that user's graphical session.
-
-### Local processes
-
-Filesystem ownership and mode protect Unix sockets. A process that can connect
-to a channel socket can control that client without OAuth.
-
-## Rationale
-
-- **Global controller grants** match controllers that need to discover a
-  changing set of clients.
-- **Separate credential domains** prevent controller credentials from
-  impersonating clients.
-- **Connector-issued OAuth tokens** satisfy ChatGPT and bind tokens to the
-  Connector MCP resource.
-- **Existing Nginx authentication** avoids another human identity system.
-- **Outbound WebSocket links** cross NAT and provide full-duplex relay and
-  transport-level liveness.
-- **Exact MCP at both boundaries** avoids a second command protocol.
-- **Non-persistent shell processes** match Mu-style workflows without terminal
-  session APIs.
-- **External screenshot programs** cover common Linux desktops without adding
-  native X11, Wayland, portal, or image-codec dependencies to the static client.
-- **Unix sockets** expose live channels to local controllers and represent them
-  in the filesystem.
-
-## Alternatives and Rejections
-
-### Direct GitHub or Linux.do OAuth tokens
-
-Rejected because those providers authenticate users but do not issue tokens
-for the Connector MCP resource. They may remain upstream identity providers
-behind the existing Nginx cookie authentication.
-
-### Per-client controller grants
-
-Rejected because client availability is dynamic and an authenticated
-controller is intended to control all clients. The global grant is explicit in
-the consent screen.
-
-### Client names embedded in MCP endpoints
-
-Rejected because controllers are not bound to one client. `/mcp` is one
-resource, `clients` discovers targets, and `bash` selects one.
-
-### Shared client and controller token
-
-Rejected because it lets a controller impersonate a disconnected client and
-cannot provide ChatGPT's OAuth workflow.
-
-### Standard Streamable HTTP for the client link
-
-Rejected because it assumes the MCP client connects to the MCP server. Here
-the MCP server is behind NAT and must initiate the network link.
-
-### Raw TCP or HTTP/2 streaming
-
-Rejected for v1 because both add deployment or custom stream complexity
-without a clear benefit over WebSocket.
-
-### Custom gateway-client command protocol
-
-Rejected because MCP already provides tool discovery, calls, results, errors,
-and cancellation.
-
-### Persistent shell tools
-
-Rejected for v1. Independent Bash calls are sufficient for agent workflows and
-avoid exposing terminal lifecycle APIs.
-
-### One-time connection codes
-
-Rejected because clients must reconnect after restarts and network failures.
-Named expiring records with reusable connection codes provide stable identity
-and controlled reuse.
-
-### In-memory credential storage
-
-Rejected because credentials and OAuth grants must survive gateway restarts.
-SQLite adds little operational complexity.
-
-### Accounts inside Connector
-
-Rejected because Nginx already establishes human identity. Connector stores
-only the stable subject needed for consent and audit relationships.
+Use the checked-in lockfile and run formatting, all-target check, Clippy with
+warnings denied, and all-target tests. Exercise real native MCP initialization,
+tools/list, calls, and cancellation on supported platforms. Test public WSS
+separately from local WS: only WSS exercises TLS provider setup and public
+certificate validation. An automated Unix prompt test must use an isolated
+controlling PTY, not merely a PTY on stdin/stdout. Revoke temporary credentials
+and remove test files/processes after interrupted as well as successful tests.

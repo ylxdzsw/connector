@@ -1,22 +1,19 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::sync::Arc;
 
-use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use futures::future::join_all;
 use rmcp::{
-    ErrorData as McpError, RoleClient, RoleServer, ServerHandler,
+    ErrorData as McpError, RoleServer, ServerHandler,
     model::{
-        CallToolRequest, CallToolRequestMethod, CallToolRequestParams, CallToolResponse,
-        CallToolResult, CancelledNotificationParam, ClientRequest, ContentBlock, Implementation,
-        JsonObject, ListToolsResult, MetaObject, PaginatedRequestParams, ServerCapabilities,
-        ServerInfo, ServerResult, Tool, ToolAnnotations,
+        CallToolRequestMethod, CallToolRequestParams, CallToolResponse, CallToolResult,
+        ContentBlock, Implementation, JsonObject, ListToolsResult, MetaObject,
+        PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
     },
-    service::{Peer, PeerRequestOptions, RequestContext},
+    service::RequestContext,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -26,26 +23,6 @@ use crate::{
     notes::{self, Notes},
     screenshot::Screenshot,
 };
-
-#[derive(Clone)]
-pub struct LiveClient {
-    pub connection_id: String,
-    pub peer: Peer<RoleClient>,
-    pub environment: ClientEnvironment,
-    pub disconnect: CancellationToken,
-}
-
-pub type LiveClients = Arc<RwLock<HashMap<String, LiveClient>>>;
-
-#[derive(Clone)]
-pub struct GatewayMcp {
-    clients: LiveClients,
-}
-
-#[derive(Clone)]
-pub struct ChannelMcp {
-    peer: Peer<RoleClient>,
-}
 
 #[derive(Clone, Default)]
 pub struct ClientMcp {
@@ -106,286 +83,9 @@ impl ClientEnvironment {
     }
 }
 
-pub fn client_environment(peer: &Peer<RoleClient>) -> Option<ClientEnvironment> {
-    peer.peer_info()
-        .and_then(|info| {
-            info.meta
-                .as_ref()
-                .and_then(|meta| meta.0.get(CLIENT_ENVIRONMENT_META))
-                .cloned()
-        })
-        .and_then(|value| serde_json::from_value(value).ok())
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct GatewayRunArgs {
-    #[schemars(description = "Connected client name")]
-    client: String,
-    #[serde(flatten)]
-    #[schemars(flatten)]
-    run: RunArgs,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct GatewayApplyPatchArgs {
-    #[schemars(description = "Connected client name")]
-    client: String,
-    #[schemars(description = "Mu/Codex-style patch envelope to apply")]
-    patch: String,
-    #[schemars(description = "Base directory for relative patch paths")]
-    cwd: Option<PathBuf>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct GatewayScreenshotArgs {
-    #[schemars(description = "Connected client name")]
-    client: String,
-}
-
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct EmptyArgs {}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct GatewayComputerArgs {
-    #[schemars(description = "Connected client name")]
-    client: String,
-    #[schemars(length(max = 32))]
-    actions: Vec<computer::Action>,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-struct ClientsOutput {
-    clients: Vec<ClientSummary>,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-struct ClientSummary {
-    #[schemars(description = "Connected client name")]
-    name: String,
-    #[schemars(description = "Operating system identifier reported by the client")]
-    system: String,
-    #[schemars(description = "Command shell reported by the client")]
-    shell: String,
-    computer: Capability,
-    notes: Notes,
-}
-
-impl GatewayMcp {
-    pub fn new(clients: LiveClients) -> Self {
-        Self { clients }
-    }
-
-    async fn invoke(
-        &self,
-        request: CallToolRequestParams,
-        cancel: CancellationToken,
-    ) -> Result<CallToolResult, McpError> {
-        match request.name.as_ref() {
-            "clients" => {
-                let snapshot: Vec<_> = self
-                    .clients
-                    .read()
-                    .await
-                    .iter()
-                    .map(|(name, client)| (name.clone(), client.clone()))
-                    .collect();
-                let mut clients = join_all(snapshot.into_iter().map(|(name, client)| async move {
-                    let notes = fetch_notes(&client).await;
-                    ClientSummary {
-                        name,
-                        system: client.environment.system,
-                        shell: client.environment.shell,
-                        computer: client.environment.computer,
-                        notes,
-                    }
-                }))
-                .await;
-                clients.sort_by(|a, b| a.name.cmp(&b.name));
-                Ok(CallToolResult::structured(json!(ClientsOutput { clients })))
-            }
-            "run" => {
-                let args: GatewayRunArgs = parse_args(request.arguments)?;
-                let client = self.clients.read().await.get(&args.client).cloned();
-                let Some(client) = client else {
-                    return Ok(tool_error(format!(
-                        "client '{}' is not connected",
-                        args.client
-                    )));
-                };
-                relay_run(&client.peer, args.run).await
-            }
-            "apply_patch" => {
-                let args: GatewayApplyPatchArgs = parse_args(request.arguments)?;
-                let client = self.clients.read().await.get(&args.client).cloned();
-                let Some(client) = client else {
-                    return Ok(tool_error(format!(
-                        "client '{}' is not connected",
-                        args.client
-                    )));
-                };
-                relay_apply_patch(
-                    &client.peer,
-                    ApplyPatchArgs {
-                        patch: args.patch,
-                        cwd: args.cwd,
-                    },
-                )
-                .await
-            }
-            "screenshot" => {
-                let args: GatewayScreenshotArgs = parse_args(request.arguments)?;
-                let client = self.clients.read().await.get(&args.client).cloned();
-                let Some(client) = client else {
-                    return Ok(tool_error(format!(
-                        "client '{}' is not connected",
-                        args.client
-                    )));
-                };
-                relay_screenshot(&client.peer).await
-            }
-            "computer" => {
-                let args: GatewayComputerArgs = parse_args(request.arguments)?;
-                let client = self.clients.read().await.get(&args.client).cloned();
-                let Some(client) = client else {
-                    return Ok(tool_error(format!(
-                        "client '{}' is not connected",
-                        args.client
-                    )));
-                };
-                relay_computer(
-                    &client.peer,
-                    ComputerArgs {
-                        actions: args.actions,
-                    },
-                    cancel,
-                )
-                .await
-            }
-            _ => Err(McpError::method_not_found::<CallToolRequestMethod>()),
-        }
-    }
-}
-
-impl ChannelMcp {
-    pub fn new(peer: Peer<RoleClient>) -> Self {
-        Self { peer }
-    }
-}
-
-impl ServerHandler for GatewayMcp {
-    fn get_info(&self) -> ServerInfo {
-        server_info(
-            "connector-gateway",
-            &format!(
-                "Control connected clients. Call clients() to discover each client's absolute notes.path and current notes.lines; the file is on that client, not the gateway.\n\n{}",
-                notes::INSTRUCTIONS
-            ),
-        )
-    }
-
-    async fn list_tools(
-        &self,
-        _: Option<PaginatedRequestParams>,
-        _: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(vec![
-            clients_tool(),
-            gateway_run_tool(),
-            gateway_apply_patch_tool(),
-            gateway_screenshot_tool(),
-            computer_tool(true),
-        ]))
-    }
-
-    fn get_tool(&self, name: &str) -> Option<Tool> {
-        match name {
-            "clients" => Some(clients_tool()),
-            "run" => Some(gateway_run_tool()),
-            "apply_patch" => Some(gateway_apply_patch_tool()),
-            "screenshot" => Some(gateway_screenshot_tool()),
-            "computer" => Some(computer_tool(true)),
-            _ => None,
-        }
-    }
-
-    async fn call_tool(
-        &self,
-        request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResponse, McpError> {
-        self.invoke(request, context.ct).await.map(Into::into)
-    }
-}
-
-impl ServerHandler for ChannelMcp {
-    fn get_info(&self) -> ServerInfo {
-        let notes = client_environment(&self.peer)
-            .map(|environment| environment.notes)
-            .unwrap_or_default();
-        server_info(
-            "connector-channel",
-            &format!(
-                "Control one connected client.\n\n{}",
-                local_notes_instructions(&notes)
-            ),
-        )
-    }
-
-    async fn list_tools(
-        &self,
-        _: Option<PaginatedRequestParams>,
-        _: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(vec![
-            run_tool(false),
-            apply_patch_tool(false),
-            screenshot_tool(false),
-            computer_tool(false),
-        ]))
-    }
-
-    fn get_tool(&self, name: &str) -> Option<Tool> {
-        match name {
-            "run" => Some(run_tool(false)),
-            "apply_patch" => Some(apply_patch_tool(false)),
-            "screenshot" => Some(screenshot_tool(false)),
-            "computer" => Some(computer_tool(false)),
-            _ => None,
-        }
-    }
-
-    async fn call_tool(
-        &self,
-        request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResponse, McpError> {
-        match request.name.as_ref() {
-            "run" => {
-                let args: RunArgs = parse_args(request.arguments)?;
-                relay_run(&self.peer, args).await.map(Into::into)
-            }
-            "apply_patch" => {
-                let args: ApplyPatchArgs = parse_args(request.arguments)?;
-                relay_apply_patch(&self.peer, args).await.map(Into::into)
-            }
-            "screenshot" => {
-                let _: EmptyArgs = parse_args(request.arguments)?;
-                relay_screenshot(&self.peer).await.map(Into::into)
-            }
-            "computer" => {
-                let args: ComputerArgs = parse_args(request.arguments)?;
-                relay_computer(&self.peer, args, context.ct)
-                    .await
-                    .map(Into::into)
-            }
-            _ => Err(McpError::method_not_found::<CallToolRequestMethod>()),
-        }
-    }
-}
 
 impl ServerHandler for ClientMcp {
     fn get_info(&self) -> ServerInfo {
@@ -415,20 +115,20 @@ impl ServerHandler for ClientMcp {
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         Ok(ListToolsResult::with_all_items(vec![
-            run_tool(false),
-            apply_patch_tool(false),
-            screenshot_tool(false),
-            computer_tool(false),
+            run_tool(),
+            apply_patch_tool(),
+            screenshot_tool(),
+            computer_tool(),
             notes_metadata_tool(),
         ]))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
         match name {
-            "run" => Some(run_tool(false)),
-            "apply_patch" => Some(apply_patch_tool(false)),
-            "screenshot" => Some(screenshot_tool(false)),
-            "computer" => Some(computer_tool(false)),
+            "run" => Some(run_tool()),
+            "apply_patch" => Some(apply_patch_tool()),
+            "screenshot" => Some(screenshot_tool()),
+            "computer" => Some(computer_tool()),
             "notes_metadata" => Some(notes_metadata_tool()),
             _ => None,
         }
@@ -532,46 +232,11 @@ impl ServerHandler for ClientMcp {
                 run_result(output)
             }
             Err(error) => {
-                tracing::warn!(request_id = ?context.id, %error, "Bash command failed");
+                tracing::warn!(request_id = ?context.id, %error, "shell command failed");
                 tool_error(error)
             }
         };
         Ok(result.into())
-    }
-}
-
-async fn fetch_notes(client: &LiveClient) -> Notes {
-    let advertised = &client.environment.notes;
-    if advertised.path.is_none() {
-        return advertised.clone();
-    }
-    let result: anyhow::Result<Notes> = async {
-        let request = ClientRequest::CallToolRequest(CallToolRequest::new(
-            CallToolRequestParams::new("notes_metadata"),
-        ));
-        let response = client
-            .peer
-            .send_request_with_option(
-                request,
-                PeerRequestOptions::with_timeout(Duration::from_secs(3)),
-            )
-            .await?
-            .await_response()
-            .await?;
-        let ServerResult::CallToolResult(result) = response else {
-            anyhow::bail!("unexpected notes metadata response");
-        };
-        anyhow::ensure!(result.is_error != Some(true), "notes metadata query failed");
-        Ok(serde_json::from_value(
-            result
-                .structured_content
-                .context("missing notes metadata")?,
-        )?)
-    }
-    .await;
-    match result {
-        Ok(notes) => notes,
-        Err(error) => advertised.unavailable(format!("notes metadata unavailable: {error}")),
     }
 }
 
@@ -584,82 +249,6 @@ fn local_notes_instructions(notes: &Notes) -> String {
         None => "This client did not provide a notes path.".into(),
     };
     format!("{location}\n\n{}", notes::INSTRUCTIONS)
-}
-
-async fn relay_run(peer: &Peer<RoleClient>, args: RunArgs) -> Result<CallToolResult, McpError> {
-    let arguments = serde_json::to_value(args)
-        .map_err(|error| McpError::internal_error(error.to_string(), None))?
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-    match peer
-        .call_tool(CallToolRequestParams::new("run").with_arguments(arguments))
-        .await
-    {
-        Ok(result) => Ok(result),
-        Err(error) => Ok(tool_error(format!("client became unavailable: {error}"))),
-    }
-}
-
-async fn relay_apply_patch(
-    peer: &Peer<RoleClient>,
-    args: ApplyPatchArgs,
-) -> Result<CallToolResult, McpError> {
-    let arguments = serde_json::to_value(args)
-        .map_err(|error| McpError::internal_error(error.to_string(), None))?
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-    match peer
-        .call_tool(CallToolRequestParams::new("apply_patch").with_arguments(arguments))
-        .await
-    {
-        Ok(result) => Ok(result),
-        Err(error) => Ok(tool_error(format!("client became unavailable: {error}"))),
-    }
-}
-
-async fn relay_screenshot(peer: &Peer<RoleClient>) -> Result<CallToolResult, McpError> {
-    match peer
-        .call_tool(CallToolRequestParams::new("screenshot"))
-        .await
-    {
-        Ok(result) => Ok(result),
-        Err(error) => Ok(tool_error(format!("screenshot unavailable: {error}"))),
-    }
-}
-
-async fn relay_computer(
-    peer: &Peer<RoleClient>,
-    args: ComputerArgs,
-    cancel: CancellationToken,
-) -> Result<CallToolResult, McpError> {
-    let arguments = serde_json::to_value(args)
-        .expect("computer arguments serialize")
-        .as_object()
-        .unwrap()
-        .clone();
-    let peer = peer.clone();
-    let cancel = cancel.child_token();
-    let _cancel_on_drop = cancel.clone().drop_guard();
-    let result = tokio::spawn(async move {
-        let request = ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams::new("computer").with_arguments(arguments)));
-        let handle = peer.send_request_with_option(request, PeerRequestOptions::with_timeout(std::time::Duration::from_secs(90))).await?;
-        let id = handle.id.clone();
-        tokio::select! {
-            result = handle.await_response() => result,
-            _ = cancel.cancelled() => {
-                let _ = peer.notify_cancelled(CancelledNotificationParam::new(Some(id), Some("controller cancelled desktop batch".into()))).await;
-                Err(rmcp::service::ServiceError::TransportClosed)
-            }
-        }
-    }).await;
-    match result {
-        Ok(Ok(ServerResult::CallToolResult(result))) => Ok(result),
-        _ => Ok(tool_error(
-            "desktop batch interrupted or client unavailable; input may have executed. Inspect a fresh screenshot before retrying.",
-        )),
-    }
 }
 
 fn parse_args<T: DeserializeOwned>(arguments: Option<JsonObject>) -> Result<T, McpError> {
@@ -717,24 +306,6 @@ fn server_info(name: &str, instructions: &str) -> ServerInfo {
         .with_instructions(instructions)
 }
 
-fn clients_tool() -> Tool {
-    secure(
-        Tool::new(
-            "clients",
-            "List connected clients with their system, shell, desktop-input capability, and persistent notes path/current line count. Search relevant notes before making changes; maintain durable decisions using run and apply_patch.",
-            empty_schema(),
-        )
-        .with_raw_output_schema(schema::<ClientsOutput>())
-        .with_annotations(
-            ToolAnnotations::new()
-                .read_only(true)
-                .destructive(false)
-                .idempotent(true)
-                .open_world(false),
-        ),
-    )
-}
-
 fn notes_metadata_tool() -> Tool {
     Tool::new(
         "notes_metadata",
@@ -745,48 +316,13 @@ fn notes_metadata_tool() -> Tool {
     .with_annotations(screenshot_annotations())
 }
 
-fn gateway_run_tool() -> Tool {
-    secure(
-        Tool::new(
-            "run",
-            "Run one non-persistent command using a connected client's shell",
-            schema::<GatewayRunArgs>(),
-        )
-        .with_raw_output_schema(schema::<RunOutput>()),
-    )
-}
-
-fn gateway_apply_patch_tool() -> Tool {
-    secure(
-        Tool::new(
-            "apply_patch",
-            "Apply one structured patch to files on a connected client",
-            schema::<GatewayApplyPatchArgs>(),
-        )
-        .with_raw_output_schema(schema::<ApplyPatchOutput>())
-        .with_annotations(apply_patch_annotations()),
-    )
-}
-
-fn gateway_screenshot_tool() -> Tool {
-    secure(
-        Tool::new(
-            "screenshot",
-            "Capture the full graphical desktop of a connected client; returns unavailable when the client cannot capture it",
-            schema::<GatewayScreenshotArgs>(),
-        )
-        .with_annotations(screenshot_annotations()),
-    )
-}
-
-fn run_tool(protected: bool) -> Tool {
-    let tool = Tool::new(
+fn run_tool() -> Tool {
+    Tool::new(
         "run",
         "Run one non-persistent command using this client's shell and return combined output and exit code",
         schema::<RunArgs>(),
     )
-    .with_raw_output_schema(schema::<RunOutput>());
-    if protected { secure(tool) } else { tool }
+    .with_raw_output_schema(schema::<RunOutput>())
 }
 
 #[cfg(unix)]
@@ -799,34 +335,31 @@ fn current_shell() -> &'static str {
     "pwsh"
 }
 
-fn apply_patch_tool(protected: bool) -> Tool {
-    let tool = Tool::new(
+fn apply_patch_tool() -> Tool {
+    Tool::new(
         "apply_patch",
         "Apply one Mu/Codex-style patch envelope after preflighting all file changes",
         schema::<ApplyPatchArgs>(),
     )
     .with_raw_output_schema(schema::<ApplyPatchOutput>())
-    .with_annotations(apply_patch_annotations());
-    if protected { secure(tool) } else { tool }
+    .with_annotations(apply_patch_annotations())
 }
 
-fn screenshot_tool(protected: bool) -> Tool {
-    let tool = Tool::new(
+fn screenshot_tool() -> Tool {
+    Tool::new(
         "screenshot",
         "Capture the full graphical desktop; returns unavailable when no supported screenshot program can access it",
         empty_schema(),
     )
-    .with_annotations(screenshot_annotations());
-    if protected { secure(tool) } else { tool }
+    .with_annotations(screenshot_annotations())
 }
 
-fn computer_tool(protected: bool) -> Tool {
-    let tool = Tool::new(
+fn computer_tool() -> Tool {
+    Tool::new(
         "computer",
         "Execute up to 32 desktop actions sequentially, then always capture one screenshot. Windows and X11 input only; requires an accessible desktop and input backend. Coordinates are integer pixels in the most recent full screenshot, origin top-left; capture first (actions: [] also captures). Stop on first failure; completed actions are not rolled back. Never replay an interrupted batch without observing. Keys/buttons are released within each action. Use wait for asynchronous UI changes; each wait is at most 5000ms, batch execution budget 30s. Desktop changes by humans or shell commands are not serialized.",
-        if protected { schema::<GatewayComputerArgs>() } else { schema::<ComputerArgs>() },
-    ).with_annotations(ToolAnnotations::new().read_only(false).destructive(true).idempotent(false).open_world(true));
-    if protected { secure(tool) } else { tool }
+        schema::<ComputerArgs>(),
+    ).with_annotations(ToolAnnotations::new().read_only(false).destructive(true).idempotent(false).open_world(true))
 }
 
 fn screenshot_annotations() -> ToolAnnotations {
@@ -843,16 +376,6 @@ fn apply_patch_annotations() -> ToolAnnotations {
         .destructive(true)
         .idempotent(false)
         .open_world(false)
-}
-
-fn secure(mut tool: Tool) -> Tool {
-    tool.meta = Some(
-        serde_json::from_value(json!({
-            "securitySchemes": [{"type": "oauth2", "scopes": ["control"]}]
-        }))
-        .expect("security metadata is an object"),
-    );
-    tool
 }
 
 fn schema<T: JsonSchema>() -> Arc<JsonObject> {
@@ -874,19 +397,9 @@ fn empty_schema() -> Arc<JsonObject> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::ServiceExt;
 
     #[test]
     fn exposes_run_tools_and_client_environment() {
-        let gateway = GatewayMcp::new(Arc::new(RwLock::new(HashMap::new())));
-        assert!(gateway.get_tool("run").is_some());
-        assert!(gateway.get_tool("apply_patch").is_some());
-        assert!(gateway.get_tool("bash").is_none());
-
-        assert!(gateway.get_tool("screenshot").is_some());
-        assert!(gateway.get_tool("computer").is_some());
-        assert!(gateway.get_tool("notes_metadata").is_none());
-
         let client = ClientMcp::default();
         assert!(client.get_tool("run").is_some());
         assert!(client.get_tool("apply_patch").is_some());
@@ -900,113 +413,6 @@ mod tests {
         assert_eq!(
             environment,
             ClientEnvironment::current(Capability::default(), Notes::default())
-        );
-    }
-
-    #[tokio::test]
-    async fn client_listing_refreshes_notes_after_regular_edits() {
-        let home = tempfile::tempdir().unwrap();
-        let path = home.path().join(".connector/NOTES.md");
-        let client = ClientMcp {
-            notes: Notes::create(path.clone()).await,
-            ..ClientMcp::default()
-        };
-        let (server_io, gateway_io) = tokio::io::duplex(16384);
-        let (server, link) = tokio::join!(client.serve(server_io), ().serve(gateway_io));
-        let server = server.unwrap();
-        let link = link.unwrap();
-        let channel = ChannelMcp::new(link.peer().clone());
-        assert!(channel.get_tool("notes_metadata").is_none());
-        let instructions = channel.get_info().instructions.unwrap();
-        assert!(instructions.contains(&serde_json::to_string(&path).unwrap()));
-        assert!(instructions.contains(notes::INSTRUCTIONS));
-        let clients = Arc::new(RwLock::new(HashMap::from([(
-            "test".into(),
-            LiveClient {
-                connection_id: "test".into(),
-                peer: link.peer().clone(),
-                environment: client_environment(link.peer()).unwrap(),
-                disconnect: CancellationToken::new(),
-            },
-        )])));
-        let gateway = GatewayMcp::new(clients);
-        assert!(
-            gateway
-                .get_info()
-                .instructions
-                .unwrap()
-                .contains(notes::INSTRUCTIONS)
-        );
-        let list = || {
-            gateway.invoke(
-                CallToolRequestParams::new("clients"),
-                CancellationToken::new(),
-            )
-        };
-        let initial = list().await.unwrap().structured_content.unwrap();
-        assert_eq!(
-            initial["clients"][0]["notes"],
-            json!({"path": path, "lines": 0})
-        );
-
-        let patch = gateway.invoke(
-            CallToolRequestParams::new("apply_patch").with_arguments(
-                json!({
-                    "client": "test",
-                    "cwd": home.path(),
-                    "patch": "*** Begin Patch\n*** Update File: .connector/NOTES.md\n@@\n+# Notes\n+\n+Keep project detail in project notes.\n*** End Patch\n"
-                }).as_object().unwrap().clone(),
-            ),
-            CancellationToken::new(),
-        ).await.unwrap();
-        assert_ne!(patch.is_error, Some(true));
-        let updated = list().await.unwrap().structured_content.unwrap();
-        assert_eq!(
-            updated["clients"][0]["notes"],
-            json!({"path": path, "lines": 3})
-        );
-
-        tokio::fs::write(&path, "External edit without a final newline")
-            .await
-            .unwrap();
-        assert_eq!(
-            list().await.unwrap().structured_content.unwrap()["clients"][0]["notes"]["lines"],
-            1
-        );
-        tokio::fs::remove_file(&path).await.unwrap();
-        let missing = list().await.unwrap().structured_content.unwrap();
-        assert_eq!(missing["clients"][0]["notes"]["path"], json!(path));
-        assert!(missing["clients"][0]["notes"]["lines"].is_null());
-        assert!(missing["clients"][0]["notes"]["error"].is_string());
-        link.cancel().await.unwrap();
-        server.cancel().await.unwrap();
-    }
-
-    #[test]
-    fn client_listing_contains_name_system_and_shell() {
-        let value = serde_json::to_value(ClientsOutput {
-            clients: vec![ClientSummary {
-                name: "build-server".into(),
-                system: "linux".into(),
-                shell: "bash".into(),
-                computer: Capability::default(),
-                notes: Notes {
-                    path: Some("/home/alice/.connector/NOTES.md".into()),
-                    lines: Some(87),
-                    error: None,
-                },
-            }],
-        })
-        .unwrap();
-        assert_eq!(
-            value,
-            json!({"clients": [{
-                "name": "build-server",
-                "system": "linux",
-                "shell": "bash",
-                "computer": {"available": false, "reason": "client did not advertise desktop input"},
-                "notes": {"path": "/home/alice/.connector/NOTES.md", "lines": 87}
-            }]})
         );
     }
 }

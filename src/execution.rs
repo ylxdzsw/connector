@@ -8,6 +8,7 @@ use tokio::{io::AsyncWriteExt, process::Command, time};
 
 pub const DEFAULT_TIMEOUT: u64 = 60;
 pub const MAX_TIMEOUT: u64 = 3600;
+pub const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RunArgs {
@@ -25,6 +26,33 @@ pub struct RunArgs {
 pub struct RunOutput {
     pub output: String,
     pub exit_code: i32,
+}
+
+#[derive(Default)]
+struct OutputBuffer {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+impl OutputBuffer {
+    fn append(&mut self, bytes: &[u8]) {
+        let remaining = MAX_OUTPUT_BYTES - self.bytes.len();
+        self.exceeded |= bytes.len() > remaining;
+        self.bytes
+            .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+    }
+
+    fn finish(self, exit_code: i32) -> Result<RunOutput, String> {
+        if self.exceeded {
+            return Err(format!(
+                "combined command output exceeded 8 MiB and was discarded (exit code {exit_code}); the command ran and may have changed state; inspect its effects before retrying"
+            ));
+        }
+        Ok(RunOutput {
+            output: String::from_utf8_lossy(&self.bytes).into_owned(),
+            exit_code,
+        })
+    }
 }
 
 pub async fn run_shell(args: RunArgs) -> Result<RunOutput, String> {
@@ -79,16 +107,24 @@ async fn run_platform(args: RunArgs, timeout: u64) -> Result<RunOutput, String> 
     }
     let pid = child.id();
     let mut process_group = ProcessGroupGuard(pid);
-    match time::timeout(Duration::from_secs(timeout), child.wait_with_output()).await {
-        Ok(Ok(result)) => {
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let drain = async {
+        use tokio::io::AsyncReadExt;
+        let mut output = OutputBuffer::default();
+        let mut chunk = [0; 8192];
+        loop {
+            let count = stdout.read(&mut chunk).await?;
+            if count == 0 {
+                return Ok::<_, std::io::Error>(output);
+            }
+            output.append(&chunk[..count]);
+        }
+    };
+    let collect = async { tokio::try_join!(child.wait(), drain) };
+    match time::timeout(Duration::from_secs(timeout), collect).await {
+        Ok(Ok((status, output))) => {
             process_group.0 = None;
-            Ok(RunOutput {
-                output: String::from_utf8_lossy(&result.stdout).into_owned(),
-                exit_code: result
-                    .status
-                    .code()
-                    .unwrap_or(128 + signal(&result.status).unwrap_or(0)),
-            })
+            output.finish(status.code().unwrap_or(128 + signal(&status).unwrap_or(0)))
         }
         Ok(Err(error)) => Err(format!("could not wait for bash: {error}")),
         Err(_) => Err(format!("command timed out after {timeout} seconds")),
@@ -134,8 +170,15 @@ async fn run_platform(args: RunArgs, timeout: u64) -> Result<RunOutput, String> 
         .map_err(|error| format!("could not start pwsh: {error}"))?;
     drop(command);
     let output_task = tokio::task::spawn_blocking(move || {
-        let mut output = Vec::new();
-        output_reader.read_to_end(&mut output).map(|_| output)
+        let mut output = OutputBuffer::default();
+        let mut chunk = [0; 8192];
+        loop {
+            let count = output_reader.read(&mut chunk)?;
+            if count == 0 {
+                return Ok::<_, std::io::Error>(output);
+            }
+            output.append(&chunk[..count]);
+        }
     });
     if let Some(input) = args.stdin {
         let mut stdin = child
@@ -152,10 +195,7 @@ async fn run_platform(args: RunArgs, timeout: u64) -> Result<RunOutput, String> 
                 .await
                 .map_err(|error| format!("could not join command output task: {error}"))?
                 .map_err(|error| format!("could not read command output: {error}"))?;
-            Ok(RunOutput {
-                output: String::from_utf8_lossy(&output).into_owned(),
-                exit_code: status.code().unwrap_or(1),
-            })
+            output.finish(status.code().unwrap_or(1))
         }
         Ok(Err(error)) => Err(format!("could not wait for pwsh: {error}")),
         Err(_) => {
@@ -241,6 +281,20 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.output, "$HOME\n");
+    }
+
+    #[tokio::test]
+    async fn excessive_output_is_drained_and_reported_as_an_error() {
+        let error = run_shell(RunArgs {
+            command: format!("head -c {} /dev/zero; exit 7", MAX_OUTPUT_BYTES + 1),
+            cwd: None,
+            timeout: Some(10),
+            stdin: None,
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("exceeded 8 MiB"));
+        assert!(error.contains("exit code 7"));
     }
 }
 
