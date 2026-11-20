@@ -7,13 +7,13 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
 async fn request(
     socket: &mut WebSocketStream<TcpStream>,
-    id: u64,
-    method: &str,
+    id: &str,
+    op: &str,
     params: Value,
 ) -> Value {
     socket
         .send(Message::Text(
-            json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params})
+            json!({"type":"call", "id":id, "op":op, "args":params})
                 .to_string()
                 .into(),
         ))
@@ -25,8 +25,8 @@ async fn request(
                 Message::Text(text) => {
                     let message: Value = serde_json::from_str(&text).unwrap();
                     if message["id"] == id {
-                        assert!(message.get("error").is_none(), "native protocol error");
-                        return message["result"].clone();
+                        assert_eq!(message["type"], "result");
+                        return message;
                     }
                 }
                 Message::Ping(bytes) => socket.send(Message::Pong(bytes)).await.unwrap(),
@@ -41,7 +41,7 @@ async fn request(
 
 #[tokio::test]
 #[allow(clippy::result_large_err)] // Tungstenite's handshake callback fixes this error type.
-async fn native_link_executes_platform_shell_and_patches() {
+async fn native_link_executes_platform_shell() {
     let home = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}/link?name=fixture", listener.local_addr().unwrap());
@@ -64,50 +64,42 @@ async fn native_link_executes_platform_shell_and_patches() {
         .unwrap();
     let mut socket = tokio_tungstenite::accept_hdr_async(
         stream,
-        |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
+        |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+         mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
             assert_eq!(request.uri().path(), "/link");
             assert_eq!(request.uri().query(), Some("name=fixture"));
             assert!(request.headers()["Authorization"] == format!("Bearer {credential}"));
+            let protocol = "sayuri-connector-v1";
+            assert_eq!(request.headers()["Sec-WebSocket-Protocol"], protocol);
+            response
+                .headers_mut()
+                .insert("Sec-WebSocket-Protocol", protocol.parse().unwrap());
             Ok(response)
         },
     )
     .await
     .unwrap();
-    let info = request(
-        &mut socket,
-        1,
-        "initialize",
-        json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"native-smoke","version":"1"}}),
-    )
-    .await;
-    let environment = &info["_meta"]["com.ylxdzsw.connector/client-environment"];
-    assert_eq!(environment["system"], std::env::consts::OS);
-    assert_eq!(
-        environment["shell"],
-        if cfg!(windows) { "pwsh" } else { "bash" }
-    );
-    socket
-        .send(Message::Text(
-            json!({"jsonrpc":"2.0","method":"notifications/initialized"})
-                .to_string()
-                .into(),
-        ))
+    let ready = timeout(Duration::from_secs(20), socket.next())
         .await
+        .unwrap()
+        .unwrap()
         .unwrap();
+    let ready: Value = serde_json::from_str(ready.to_text().unwrap()).unwrap();
+    assert_eq!(ready["type"], "ready");
+    assert_eq!(ready["system"], std::env::consts::OS);
+    assert_eq!(ready["shell"], if cfg!(windows) { "pwsh" } else { "bash" });
+    assert_eq!(
+        ready["notes"],
+        json!(home.path().join(".connector").join("NOTES.md"))
+    );
     let command = if cfg!(windows) {
         "[Console]::Out.Write('linked-client'); exit 7"
     } else {
         "printf linked-client; exit 7"
     };
-    let run = request(
-        &mut socket,
-        2,
-        "tools/call",
-        json!({"name":"run","arguments":{"command":command}}),
-    )
-    .await;
+    let run = request(&mut socket, "2", "exec", json!({"command":command})).await;
     assert_eq!(
-        run["structuredContent"],
+        run["result"],
         json!({"output":"linked-client","exit_code":7})
     );
     let input = "literal $HOME; (not a command)\n";
@@ -118,48 +110,19 @@ async fn native_link_executes_platform_shell_and_patches() {
     };
     let run = request(
         &mut socket,
-        3,
-        "tools/call",
-        json!({"name":"run","arguments":{"command":command,"stdin":input,"cwd":home.path()}}),
+        "3",
+        "exec",
+        json!({"command":command,"stdin":input,"cwd":home.path()}),
     )
     .await;
-    assert_eq!(run["structuredContent"]["output"], input);
-    let patch = request(&mut socket, 4, "tools/call", json!({"name":"apply_patch","arguments":{"cwd":home.path(),"patch":"*** Begin Patch\n*** Add File: smoke.txt\n+native-patch\n*** End Patch"}})).await;
-    assert_ne!(patch["isError"], true);
-    assert_eq!(
-        std::fs::read_to_string(home.path().join("smoke.txt")).unwrap(),
-        "native-patch\n"
-    );
-    let notes = request(
-        &mut socket,
-        5,
-        "tools/call",
-        json!({"name":"notes_metadata","arguments":{}}),
-    )
-    .await;
-    assert_eq!(
-        notes["structuredContent"]["path"],
-        json!(home.path().join(".connector").join("NOTES.md"))
-    );
+    assert_eq!(run["result"]["output"], input);
     let command = if cfg!(windows) {
         "[Console]::Out.Write('x' * 9000000)"
     } else {
         "head -c 9000000 /dev/zero"
     };
-    let overflow = request(
-        &mut socket,
-        6,
-        "tools/call",
-        json!({"name":"run","arguments":{"command":command}}),
-    )
-    .await;
-    assert_eq!(overflow["isError"], true);
-    assert!(
-        overflow["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("8 MiB")
-    );
+    let overflow = request(&mut socket, "6", "exec", json!({"command":command})).await;
+    assert!(overflow["error"].as_str().unwrap().contains("8 MiB"));
     child.kill().await.unwrap();
     child.wait().await.unwrap();
 }

@@ -1,6 +1,5 @@
 use std::{sync::Arc, time::Duration};
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::{sync::Mutex, time};
 use tokio_util::sync::CancellationToken;
@@ -14,7 +13,7 @@ mod platform;
 #[path = "computer/windows.rs"]
 mod platform;
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Capability {
     /// Desktop input prerequisites detected at connection time; calls can still fail.
     pub available: bool,
@@ -58,15 +57,14 @@ pub async fn capability() -> Capability {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComputerArgs {
     /// Up to 32 sequential actions. Always returns a final screenshot; [] observes only.
-    #[schemars(length(max = 32))]
     pub actions: Vec<Action>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     Move {
@@ -79,7 +77,6 @@ pub enum Action {
         #[serde(default)]
         button: Button,
         #[serde(default = "one")]
-        #[schemars(range(min = 1, max = 3))]
         count: u8,
         #[serde(default)]
         modifiers: Vec<Modifier>,
@@ -89,7 +86,6 @@ pub enum Action {
         y: u32,
         direction: Direction,
         /// Wheel steps, 1..100. The application determines the distance scrolled.
-        #[schemars(range(min = 1, max = 100))]
         amount: u32,
         #[serde(default)]
         modifiers: Vec<Modifier>,
@@ -105,17 +101,14 @@ pub enum Action {
     Key {
         /// One chord: A-Z, 0-9, F1-F12, CTRL, ALT, SHIFT, SUPER, ENTER, TAB, ESC,
         /// SPACE, BACKSPACE, DELETE, INSERT, HOME, END, PAGEUP, PAGEDOWN, UP, DOWN, LEFT, RIGHT.
-        #[schemars(length(min = 1, max = 8))]
         keys: Vec<String>,
     },
     Type {
         /// Literal Unicode text, at most 8192 UTF-8 bytes. Does not modify the clipboard.
-        #[schemars(length(max = 8192))]
         text: String,
     },
     Wait {
         /// Wait 0..5000 milliseconds before continuing.
-        #[schemars(range(max = 5000))]
         ms: u64,
     },
 }
@@ -124,14 +117,14 @@ fn one() -> u8 {
     1
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Point {
     pub x: u32,
     pub y: u32,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Button {
     #[default]
@@ -140,7 +133,7 @@ pub enum Button {
     Middle,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
     Up,
@@ -149,7 +142,7 @@ pub enum Direction {
     Right,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Modifier {
     Ctrl,

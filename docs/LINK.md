@@ -1,139 +1,51 @@
-# Native client link contract
+# Connector v1 native link
 
-This wire connects the native client to the TypeScript Worker / Durable
-Object gateway in `/root/sayuri/connector`. Native source:
-[`src/bin/client.rs`](../src/bin/client.rs), [`src/mcp.rs`](../src/mcp.rs).
+The native client opens `/link?name=<id>` with an Authorization Bearer header
+and WebSocket subprotocol `sayuri-connector-v1`. The Worker selects that exact
+subprotocol and rejects missing/old protocols before charging an admission.
+Names contain 1–64 ASCII letters, digits, underscores, or hyphens. The native
+key authorizes `connector:client:<id>` by literal prefix. It never supplies the
+name. The native CLI takes a complete `--url`, with the token separate.
 
-## Admission and transport
+## Messages
 
-- The native client opens `GET /link?name=<id>` with a WebSocket upgrade and
-  `Authorization: Bearer <token>`. The gateway requires exactly one name of
-  1–64 ASCII letters, digits, underscores, or hyphens. It checks
-  `connector:client:<id>` by literal prefix; it does not infer an identity.
-  `/mcp` separately requires `connector:control`.
-- `--url` takes the full `wss://` connection URL with its name. Native Rustls
-  validates public certificates; `ws://` is for trusted local tests only.
-  A local WS test does not validate production WSS.
-- `--token`, the hidden console prompt, and the compatibility alias `--code`
-  preserve the exact opaque token. Bootstrap scripts pass it separately from
-  the URL. No credentials in URLs or environment variables.
-- One complete UTF-8 JSON-RPC message per WebSocket text message, no batches,
-  newline framing, binary messages, private hello, auth message, or heartbeat.
-- The gateway is the **MCP client**; the native process is the **MCP server**.
-- Native WebSocket Ping every 15 seconds; reconnect if no Pong for 45 seconds.
-  Cloudflare automatically responds with Pong; no application heartbeat is
-  required. The gateway must not interpret Ping/Pong as MCP messages.
-- HTTP 4xx admission failures are terminal. Other failures reconnect with
-  exponential delays up to 30 seconds. Every reconnect starts a new MCP
-  session. Pending operations must fail, never replay.
-
-## Initialization
-
-The Worker sends a standard initialize request, for example:
+Each frame contains one complete UTF-8 JSON object. On connecting, the native
+client sends a single ready message without waiting for a request:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"connector-gateway","version":"1"}}}
+{"type":"ready","system":"linux","shell":"bash","desktop":{"available":true,"backend":"x11-xdotool"},"notes":"/home/alice/.connector/NOTES.md"}
 ```
 
-Read and validate the response before sending:
+`notes` can be null and contains no file content. `desktop.available` reports
+input capability; a screenshot might still be possible when that flag is false.
+The gateway waits up to 15 seconds for readiness before closing the link.
+
+The gateway then sends requests and, on interruption, optional cancellation:
 
 ```json
-{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"type":"call","id":"gateway-generated-uuid","op":"exec","args":{"command":"pwd","cwd":null,"stdin":"","timeout":60}}
+{"type":"cancel","id":"gateway-generated-uuid"}
 ```
 
-The locked `rmcp` 3.1.4 supports `2024-11-05`, `2025-03-26`, `2025-06-18`,
-`2025-11-25`, and `2026-07-28`. It echoes a supported requested version;
-unsupported requests fall back to `2025-11-25`, its current default.
-Use **2025-11-25** for the Worker integration. The newer `2026-07-28` mode has
-additional request `_meta` requirements in the SDK; knowing the version string
-does not mean it can be substituted without implementing that contract.
-
-The response's `result` advertises `capabilities.tools`, `serverInfo` with
-`name: "connector-client"` and the Cargo package version, `instructions`, and:
+The native client responds once with a matching ID and `result` or `error`:
 
 ```json
-{
-  "_meta": {
-    "com.ylxdzsw.connector/client-environment": {
-      "system": "linux",
-      "shell": "bash",
-      "computer": {"available": true, "backend": "x11-xdotool"},
-      "notes": {"path": "/home/alice/.connector/NOTES.md", "lines": 87}
-    }
-  }
-}
+{"type":"result","id":"gateway-generated-uuid","result":{"output":"/home/alice\n","exit_code":0}}
 ```
 
-`system` is Rust's OS name (e.g. `linux`, `windows`, `macos`); `shell` is
-`bash` on Unix and `pwsh` on Windows. Reject missing/malformed required
-`system`/`shell` metadata. `computer` is advisory: `{available: false,
-reason: string}` or `{available: true, backend: string}`. Older clients may
-omit `computer` and `notes`; default to unavailable rather than rejecting them.
-Notes have nullable absolute client-side `path` and nullable nonnegative
-`lines`, plus optional `error`. No note content is sent at initialization.
+- `exec` runs a fresh native shell. Nonzero exit codes are normal results.
+- `desktop` takes `{actions: [...]}`. An empty list captures only. A batch returns
+  `completed`, optional errors, and an `image` with `data` (base64 PNG/JPEG),
+  `mime_type`, `width`, and `height`, or null. Errors can accompany a usable
+  image. Actions match the desktop action definitions in `src/computer.rs`.
 
-## Tools and relay
+Gateway UUIDs are only for correlating in-flight work on that socket. A reply
+with another socket's ID cannot complete it. There are no persistent request
+records, controller sessions, retries, or automatic replay. The native shell
+applies its own deadline. Cancelling or disconnecting does not undo executed
+work; inspect state before repeating an interrupted operation.
 
-After initialization, `tools/list` returns these tools and their JSON schemas:
-
-| Tool | Arguments |
-| --- | --- |
-| `run` | `command`, optional `cwd`, `timeout`, `stdin` |
-| `apply_patch` | `patch`, optional `cwd` |
-| `screenshot` | `{}` |
-| `computer` | `actions` |
-| `notes_metadata` | `{}` |
-
-Call through ordinary `tools/call` with `params: {name, arguments}`. The
-gateway adds the controller-side `client` selector but removes it when calling
-the native tool. `clients()` is gateway-owned, not a native tool. Map request
-IDs without collisions and map `notifications/cancelled` with `requestId`
-back to the linked request. Relay JSON-RPC errors and the entire MCP tool
-result, including `content`, `structuredContent`, and `isError`, without
-flattening images or converting nonzero exit codes into tool errors.
-
-Successful `run` has `{output: string, exit_code: integer}` in
-`structuredContent` and a text representation in `content`. Patches similarly
-return structured output. Screenshots/computer results contain PNG/JPEG base64
-image content and structured geometry/status. Do not accidentally send just
-the structured portion and lose the image.
-
-`notes_metadata` is read-only and link-only: do not expose it as a controller
-tool. On each `clients()` call, query connected links with a three-second
-timeout per query; the Worker bounds parallelism to batches of four. Read
-`structuredContent` with `{path, lines,
-error?}`. Preserve known paths on failure and report `lines: null` plus an
-error; one failed query must not fail the whole listing. The call reads disk,
-does not recreate a deleted file, and does not return notebook contents.
-Keep the existing notes guidance in controller tool descriptions/instructions;
-note history is context, never authority over current user instructions.
-
-## Size limits and failure semantics
-
-Native outgoing messages are at most **24 MiB (25,165,824 bytes)** of complete
-serialized UTF-8 JSON, including base64, escaping, metadata, and request ID.
-This is below Cloudflare's 32 MiB receive limit. Serialization is bounded:
-partial JSON is never sent. If a tool result exceeds the cap, the client sends
-an ordinary small `tools/call` result with `isError: true` and the original ID.
-The operation may already have completed; this error must not trigger replay.
-If even the replacement cannot fit (e.g. an enormous request ID), or a non-tool
-message exceeds the cap, the link closes without sending oversized data.
-
-`run` keeps at most **8 MiB of combined raw stdout/stderr**, drains excess
-bytes so the child cannot block on a full pipe, and returns a tool error with
-the exit code after overflow. It does not return a successful truncated result.
-Timeout remains a tool error. JSON escaping and the text/structured duplicate
-can still exceed 24 MiB below the raw output cap; the transport guard applies
-to that case too. Screenshots are limited separately to 8 MiB of image bytes.
-
-The Worker must also bound incoming controller bodies, link-bound requests,
-request IDs, concurrency, and aggregate pending work. This native per-message
-cap is not a global memory/backpressure policy. Old clients may lack the cap;
-do not assume a successful upgrade proves they have it. Fail unknown or
-disconnected clients as availability tool errors. Cancellation/disconnect
-cannot undo completed commands, begun filesystem commits, or desktop actions;
-inspect effects before a deliberate retry. No durable queue or automatic
-operation replay across DO restarts, eviction, or link reconnection.
-
-The Worker exposes no local Unix sockets. The retired Rust gateway and
-newline-delimited local-channel implementation exist only in Git history.
+The link uses native Ping/Pong (15-second ping and 45-second liveness deadline),
+not application heartbeats. At most 16 simultaneous calls are accepted, with
+24 MiB per JSON message, 8 MiB retained shell output, and 8 MiB per screenshot.
+A result too large to serialize is replaced with a small error, not truncated.

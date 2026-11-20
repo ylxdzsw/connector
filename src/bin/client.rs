@@ -1,25 +1,32 @@
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::Parser;
-use connector::mcp::ClientMcp;
-use futures::{SinkExt, StreamExt, channel::mpsc};
-use rmcp::{
-    ServiceExt,
-    model::{
-        CallToolResult, ClientJsonRpcMessage, ContentBlock, ServerJsonRpcMessage, ServerResult,
-    },
+use connector::{
+    computer::{self, ComputerArgs, Desktop},
+    execution::{RunArgs, run_shell},
+    notes::Notes,
+    screenshot::Screenshot,
 };
-use tokio::time::sleep;
+use futures::{SinkExt, StreamExt};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio::{
+    sync::Mutex,
+    task::JoinSet,
+    time::{self, Instant, sleep},
+};
 use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{Message, client::IntoClientRequest},
+    connect_async_with_config,
+    tungstenite::{Message, client::IntoClientRequest, protocol::WebSocketConfig},
 };
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
+
+const PROTOCOL: &str = "sayuri-connector-v1";
+const MAX_MESSAGE: usize = 24 * 1024 * 1024;
+const MAX_CALLS: usize = 16;
 
 #[derive(Parser)]
 #[command(version, about = "Connect this host to a Connector gateway")]
@@ -60,15 +67,16 @@ async fn main() -> Result<()> {
         _ => tokio::task::spawn_blocking(read_token).await??,
     };
     let authorization = token_header(&token)?;
-    let client = ClientMcp::new().await;
+    let desktop = Arc::new(Mutex::new(Desktop::default()));
+    let notes = Notes::initialize().await;
     let mut delay = 1;
     loop {
         let result = tokio::select! {
-            result = connect(endpoint, &authorization, &client) => Some(result),
+            result = connect(endpoint, &authorization, &desktop, &notes) => Some(result),
             _ = tokio::signal::ctrl_c() => None,
         };
         let Some(result) = result else {
-            client.finish_desktop().await;
+            drop(desktop.lock().await);
             return Ok(());
         };
         match result {
@@ -81,7 +89,7 @@ async fn main() -> Result<()> {
         }
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                client.finish_desktop().await;
+                drop(desktop.lock().await);
                 return Ok(());
             },
             _ = sleep(Duration::from_secs(delay)) => {}
@@ -120,127 +128,153 @@ enum LinkError {
     Other(#[from] anyhow::Error),
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Incoming {
+    Call {
+        id: String,
+        #[serde(flatten)]
+        operation: Operation,
+    },
+    Cancel {
+        id: String,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "op", content = "args", rename_all = "snake_case")]
+enum Operation {
+    Exec(RunArgs),
+    Desktop(ComputerArgs),
+}
+
+fn image_result(image: Screenshot) -> Value {
+    json!({"data": STANDARD.encode(image.data), "mime_type": image.mime_type,
+        "width": image.width, "height": image.height})
+}
+
+async fn execute(
+    operation: Operation,
+    desktop: Arc<Mutex<Desktop>>,
+    cancel: CancellationToken,
+) -> Result<Value, String> {
+    match operation {
+        Operation::Exec(args) => Ok(json!(run_shell(args).await?)),
+        Operation::Desktop(args) if args.actions.is_empty() => {
+            let image = desktop.lock().await.capture().await?;
+            Ok(json!({"completed": 0, "error": null, "image": image_result(image)}))
+        }
+        Operation::Desktop(args) => {
+            let output = computer::execute(desktop, args, cancel).await?;
+            let (image, screenshot_error) = match output.screenshot {
+                Ok(image) => (Some(image_result(image)), None),
+                Err(error) => (None, Some(error)),
+            };
+            Ok(json!({"completed": output.completed, "error": output.error,
+                "screenshot_error": screenshot_error, "image": image}))
+        }
+    }
+}
+
 async fn connect(
     endpoint: &str,
     authorization: &http::HeaderValue,
-    client: &ClientMcp,
+    desktop: &Arc<Mutex<Desktop>>,
+    notes: &Notes,
 ) -> Result<(), LinkError> {
-    let cancel = CancellationToken::new();
-    let _cancel_on_drop = cancel.clone().drop_guard();
-    let client = client.for_link(cancel.clone()).await;
     let mut request = endpoint
         .into_client_request()
-        .map_err(|e| LinkError::Other(e.into()))?;
+        .map_err(anyhow::Error::from)?;
     request
         .headers_mut()
         .insert(http::header::AUTHORIZATION, authorization.clone());
-    let (socket, _) = match connect_async(request).await {
+    request.headers_mut().insert(
+        http::header::SEC_WEBSOCKET_PROTOCOL,
+        http::HeaderValue::from_static(PROTOCOL),
+    );
+    let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE));
+    let (mut socket, _) = match connect_async_with_config(request, Some(config), false).await {
         Ok(connection) => connection,
         Err(tokio_tungstenite::tungstenite::Error::Http(response))
             if response.status().is_client_error() =>
         {
             return Err(LinkError::Rejected(response.status()));
         }
-        Err(error) => return Err(LinkError::Other(error.into())),
+        Err(error) => return Err(anyhow::Error::from(error).into()),
     };
-    tracing::info!("connected");
-    let (outgoing, outgoing_rx) = mpsc::unbounded::<ServerJsonRpcMessage>();
-    let (incoming_tx, incoming) = mpsc::unbounded::<ClientJsonRpcMessage>();
-    let mut io_task = tokio::spawn(websocket_io(
-        socket,
-        outgoing_rx,
-        incoming_tx,
-        cancel.clone(),
-    ));
-    let service = client
-        .serve_with_ct((outgoing, incoming), cancel.clone())
+    desktop.lock().await.invalidate();
+    let capability = computer::capability().await;
+    let shell = if cfg!(windows) { "pwsh" } else { "bash" };
+    let ready = json!({"type": "ready", "system": std::env::consts::OS, "shell": shell,
+        "desktop": capability, "notes": notes.path});
+    socket
+        .send(Message::Text(ready.to_string().into()))
         .await
-        .map_err(|e| LinkError::Other(e.into()))?;
-    tokio::select! {
-        result = service.waiting() => {
-            result.map_err(|e| LinkError::Other(e.into()))?;
+        .map_err(anyhow::Error::from)?;
+    tracing::info!("connected");
+
+    let mut calls = HashMap::<String, CancellationToken>::new();
+    let mut tasks = JoinSet::new();
+    let mut ping = time::interval(Duration::from_secs(15));
+    let mut last_pong = Instant::now();
+    loop {
+        let send = tokio::select! {
+            incoming = socket.next() => match incoming {
+                Some(Ok(Message::Text(text))) => match serde_json::from_str::<Incoming>(&text) {
+                    Ok(Incoming::Call { id, operation }) => {
+                        if calls.contains_key(&id) { break; }
+                        if calls.len() >= MAX_CALLS {
+                            Some(Message::Text(reply(&id, Err("Native client is busy".into()))?.into()))
+                        } else {
+                            let cancel = CancellationToken::new();
+                            calls.insert(id.clone(), cancel.clone());
+                            let desktop = desktop.clone();
+                            tasks.spawn(async move {
+                                let result = tokio::select! {
+                                    _ = cancel.cancelled() => Err("Request cancelled; inspect state before retrying".into()),
+                                    result = execute(operation, desktop, cancel.clone()) => result,
+                                };
+                                (id, result)
+                            });
+                            None
+                        }
+                    },
+                    Ok(Incoming::Cancel { id }) => {
+                        if let Some(cancel) = calls.get(&id) { cancel.cancel(); }
+                        None
+                    },
+                    Err(_) => break,
+                },
+                Some(Ok(Message::Pong(_))) => { last_pong = Instant::now(); None },
+                Some(Ok(Message::Ping(_))) => { socket.flush().await.map_err(anyhow::Error::from)?; None },
+                _ => break,
+            },
+            completed = tasks.join_next(), if !tasks.is_empty() => {
+                let (id, result) = completed.expect("task pending").map_err(anyhow::Error::from)?;
+                calls.remove(&id);
+                Some(Message::Text(reply(&id, result)?.into()))
+            },
+            _ = ping.tick() => {
+                if last_pong.elapsed() > Duration::from_secs(45) { break; }
+                Some(Message::Ping(Vec::new().into()))
+            },
+        };
+        if let Some(message) = send {
+            time::timeout(Duration::from_secs(15), socket.send(message))
+                .await
+                .map_err(anyhow::Error::from)?
+                .map_err(anyhow::Error::from)?;
         }
-        _ = &mut io_task => {}
-    }
-    cancel.cancel();
-    if !io_task.is_finished() {
-        let _ = io_task.await;
     }
     Ok(())
 }
-
-async fn websocket_io(
-    socket: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-    mut outgoing: mpsc::UnboundedReceiver<ServerJsonRpcMessage>,
-    incoming: mpsc::UnboundedSender<ClientJsonRpcMessage>,
-    cancel: CancellationToken,
-) {
-    let (mut write, mut read) = socket.split();
-    let last_pong = Arc::new(std::sync::Mutex::new(Instant::now()));
-    let reader_pong = last_pong.clone();
-    let reader_cancel = cancel.clone();
-    let mut reader = tokio::spawn(async move {
-        while let Some(message) = read.next().await {
-            match message {
-                Ok(Message::Text(text)) => match serde_json::from_str(&text) {
-                    Ok(message) => {
-                        if incoming.unbounded_send(message).is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) => tracing::warn!(%error, "invalid gateway MCP message"),
-                },
-                Ok(Message::Pong(_)) => *reader_pong.lock().expect("pong lock") = Instant::now(),
-                Ok(Message::Close(_)) | Err(_) => break,
-                _ => {}
-            }
-        }
-        reader_cancel.cancel();
-    });
-    let mut ping = tokio::time::interval(Duration::from_secs(15));
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            _ = ping.tick() => {
-                if last_pong.lock().expect("pong lock").elapsed() > Duration::from_secs(45) { break; }
-                if write.send(Message::Ping(Vec::new().into())).await.is_err() { break; }
-            }
-            message = outgoing.next() => match message {
-                Some(message) => {
-                    let text = match outgoing_message(message) {
-                        Ok(text) => text,
-                        Err(error) => {
-                            tracing::warn!(%error, "cannot send MCP message");
-                            break;
-                        }
-                    };
-                    if write.send(Message::Text(text.into())).await.is_err() { break; }
-                },
-                None => break,
-            }
-        }
-    }
-    cancel.cancel();
-    let _ = write.send(Message::Close(None)).await;
-    drop(write);
-    if tokio::time::timeout(Duration::from_secs(2), &mut reader)
-        .await
-        .is_err()
-    {
-        reader.abort();
-    }
-}
-
-const MAX_MCP_MESSAGE_BYTES: usize = 24 * 1024 * 1024;
 
 struct MessageBuffer(Vec<u8>);
 
 impl std::io::Write for MessageBuffer {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > MAX_MCP_MESSAGE_BYTES - self.0.len() {
-            return Err(std::io::Error::other("MCP message exceeds 24 MiB"));
+        if bytes.len() > MAX_MESSAGE - self.0.len() {
+            return Err(std::io::Error::other("Link message exceeds 24 MiB"));
         }
         self.0.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -251,30 +285,18 @@ impl std::io::Write for MessageBuffer {
     }
 }
 
-fn serialize_message(message: &ServerJsonRpcMessage) -> Result<String> {
+fn reply(id: &str, result: Result<Value, String>) -> Result<String> {
+    let reply = match result {
+        Ok(result) => json!({"type": "result", "id": id, "result": result}),
+        Err(error) => json!({"type": "result", "id": id, "error": error}),
+    };
     let mut buffer = MessageBuffer(Vec::new());
-    serde_json::to_writer(&mut buffer, message)?;
-    Ok(String::from_utf8(buffer.0).expect("JSON is UTF-8"))
-}
-
-fn outgoing_message(mut message: ServerJsonRpcMessage) -> Result<String> {
-    match serialize_message(&message) {
-        Ok(text) => Ok(text),
-        Err(error) => {
-            if let ServerJsonRpcMessage::Response(response) = &mut message
-                && matches!(response.result, ServerResult::CallToolResult(_))
-            {
-                response.result = ServerResult::CallToolResult(CallToolResult::error(vec![
-                    ContentBlock::text(
-                        "Tool result exceeds the 24 MiB link limit and was discarded. The operation may have completed; inspect its effects before retrying. It has not been replayed.",
-                    ),
-                ]));
-                serialize_message(&message)
-            } else {
-                Err(error)
-            }
-        }
+    if serde_json::to_writer(&mut buffer, &reply).is_err() {
+        return Ok(json!({"type": "result", "id": id,
+            "error": "Result exceeds 24 MiB; inspect state before retrying"})
+        .to_string());
     }
+    Ok(String::from_utf8(buffer.0).expect("JSON is UTF-8"))
 }
 
 #[cfg(test)]
@@ -308,17 +330,11 @@ mod tests {
     }
 
     #[test]
-    fn oversized_result_is_a_tool_error_with_the_same_id() {
-        let message = ServerJsonRpcMessage::response(
-            ServerResult::CallToolResult(CallToolResult::success(vec![ContentBlock::text(
-                "\0".repeat(MAX_MCP_MESSAGE_BYTES / 6),
-            )])),
-            rmcp::model::RequestId::Number(42),
-        );
-        let text = outgoing_message(message).unwrap();
-        assert!(text.len() <= MAX_MCP_MESSAGE_BYTES);
-        let response: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(response["id"], 42);
-        assert_eq!(response["result"]["isError"], true);
+    fn oversized_result_is_an_error_with_the_same_id() {
+        let text = reply("42", Ok(json!("\0".repeat(MAX_MESSAGE / 6)))).unwrap();
+        assert!(text.len() <= MAX_MESSAGE);
+        let response: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(response["id"], "42");
+        assert!(response["error"].is_string());
     }
 }

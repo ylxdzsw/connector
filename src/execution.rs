@@ -10,19 +10,15 @@ pub const DEFAULT_TIMEOUT: u64 = 60;
 pub const MAX_TIMEOUT: u64 = 3600;
 pub const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunArgs {
-    #[schemars(description = "Command text to execute in a fresh shell")]
     pub command: String,
-    #[schemars(description = "Working directory for the command")]
     pub cwd: Option<PathBuf>,
-    #[schemars(description = "Maximum run time in seconds (default 60, maximum 3600)")]
     pub timeout: Option<u64>,
-    #[schemars(description = "Literal bytes supplied to standard input as UTF-8 text")]
     pub stdin: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunOutput {
     pub output: String,
     pub exit_code: i32,

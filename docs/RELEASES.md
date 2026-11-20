@@ -20,8 +20,8 @@ cargo build --release --locked --target x86_64-pc-windows-msvc --bin connector-c
 ```
 
 The CI Windows job runs all-target checks, Clippy and tests, including a real
-native WebSocket/MCP fixture exercising PowerShell, literal stdin, patching,
-notes and output bounds. It then builds the release and checks a real public
+native WebSocket fixture exercising PowerShell, literal stdin, notes and output
+bounds. It then builds the release and checks a real public
 WSS connection using a random, unregistered credential: successful certificate
 validation followed by HTTP 401 is expected. No live controller/client token
 is stored in CI.
