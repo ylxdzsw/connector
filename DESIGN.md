@@ -5,7 +5,7 @@
 This Rust package contains only the native Unix/Windows `connector-client`.
 The gateway is the TypeScript Worker / SQLite Durable Object project at
 `/root/sayuri/connector`. Sayuri owns token authorization; the Worker owns
-controller MCP/OAuth, link coordination, bootstrap routes, and R2 downloads.
+controller MCP, link coordination, bootstrap routes, and R2 downloads.
 The retired Rust gateway, SQLite credential issuer, Nginx/systemd deployment,
 and local Unix-socket channels exist only in Git history.
 
@@ -30,14 +30,11 @@ standard MCP; there is no private command or heartbeat protocol.
 
 ## Credentials and trust
 
-Sayuri tokens are opaque, case-sensitive bearers. The Worker requires
-`connector:client:<name>` on `/link` and `connector:control` for direct
-controller access on `/mcp`; Worker-issued controller OAuth tokens are also
-supported. Client identity comes from the authorized capability, not a name
-asserted by the native process. Client and controller capabilities are distinct
-authorizations in the same token system; presenting a token at the other
-endpoint must not give it extra authority. Expiry, revocation, and OAuth
-lifecycle policy belong to Sayuri and the Worker, not the native package.
+Sayuri tokens are opaque, case-sensitive bearers. The native client supplies an
+explicit name in the WebSocket URL. The Worker checks `connector:client:<name>`
+by literal prefix for that name, and separately checks `connector:control` on
+`/mcp` for fleet-wide access. These authorizations are distinct. Expiry and
+revocation policy belong to Sayuri and the Worker, not the native package.
 
 `--token` is the canonical native option; `--code` is an exact opaque alias
 only, without the retired Crockford normalization. Without either, the client
@@ -47,9 +44,10 @@ valid HTTP bearer header values without whitespace. Invalid tokens are
 rejected, not transformed; errors do not include their value. Command-line
 credentials can be visible in process inspection and shell history.
 
-`--gateway` defaults to `https://connector.ylxdzsw.com` and maps HTTP(S) to
-WS(S) `/link`. Rustls validates certificates using the explicitly installed
-ring provider. HTTP is suitable only for trusted local testing. Authentication
+`--url` accepts the complete WebSocket URL, for example
+`wss://connector.ylxdzsw.com/link?name=desktop`. Rustls validates certificates
+using the explicitly installed ring provider. Plain WS is only for trusted
+local testing. Authentication
 occurs during WebSocket upgrade. Ping/Pong supplies transport liveness; each
 text message contains one complete MCP JSON-RPC message. Admission HTTP 4xx
 is terminal; transient failures reconnect with bounded exponential backoff.
@@ -57,7 +55,7 @@ is terminal; transient failures reconnect with bounded exponential backoff.
 A native client trusts the gateway to send authorized commands; it does not
 identify the originating controller. Gateway compromise or an active
 controller grant permits commands on connected clients. A stolen client token
-can permit impersonating that named client, receiving intended commands, and
+can permit impersonating clients with matching names, receiving commands, and
 forging results, but does not itself grant controller access. There are no
 Nginx identity-header or local-socket authorization bypasses.
 

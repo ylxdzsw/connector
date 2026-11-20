@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use connector::mcp::ClientMcp;
 use futures::{SinkExt, StreamExt, channel::mpsc};
@@ -24,9 +24,9 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(version, about = "Connect this host to a Connector gateway")]
 struct Args {
-    /// Gateway base URL (use HTTP only for trusted local testing)
-    #[arg(long, default_value = "https://connector.ylxdzsw.com")]
-    gateway: String,
+    /// Full connection URL, including /link?name=ID (use ws:// only for local testing)
+    #[arg(long, value_name = "WS_URL")]
+    url: String,
     /// Opaque, case-sensitive client token
     #[arg(
         long,
@@ -53,18 +53,18 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
+    let endpoint = websocket_endpoint(&args.url)?;
     let token = match (args.token, args.code) {
         (Some(token), _) => token,
         (_, Some(code)) => code,
         _ => tokio::task::spawn_blocking(read_token).await??,
     };
     let authorization = token_header(&token)?;
-    let endpoint = websocket_endpoint(&args.gateway)?;
     let client = ClientMcp::new().await;
     let mut delay = 1;
     loop {
         let result = tokio::select! {
-            result = connect(&endpoint, &authorization, &client) => Some(result),
+            result = connect(endpoint, &authorization, &client) => Some(result),
             _ = tokio::signal::ctrl_c() => None,
         };
         let Some(result) = result else {
@@ -104,16 +104,12 @@ fn token_header(token: &str) -> Result<http::HeaderValue> {
     Ok(header)
 }
 
-fn websocket_endpoint(gateway: &str) -> Result<String> {
-    let gateway = gateway.trim_end_matches('/');
-    let endpoint = if let Some(rest) = gateway.strip_prefix("https://") {
-        format!("wss://{rest}/link")
-    } else if let Some(rest) = gateway.strip_prefix("http://") {
-        format!("ws://{rest}/link")
-    } else {
-        bail!("gateway URL must begin with http:// or https://")
-    };
-    Ok(endpoint)
+fn websocket_endpoint(url: &str) -> Result<&str> {
+    let endpoint: http::Uri = url.parse().context("Invalid WebSocket URL")?;
+    if !matches!(endpoint.scheme_str(), Some("wss" | "ws")) || endpoint.host().is_none() {
+        bail!("Connection URL must begin with wss:// or ws://");
+    }
+    Ok(url)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -286,21 +282,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn converts_gateway_url() {
+    fn preserves_named_websocket_url() {
         assert_eq!(
-            websocket_endpoint("https://example.com/").unwrap(),
-            "wss://example.com/link"
+            websocket_endpoint("wss://example.com/link?name=My-PC").unwrap(),
+            "wss://example.com/link?name=My-PC"
         );
-        assert_eq!(
-            websocket_endpoint("http://127.0.0.1:3000").unwrap(),
-            "ws://127.0.0.1:3000/link"
-        );
+        assert!(websocket_endpoint("https://example.com/").is_err());
     }
 
     #[test]
     fn preserves_opaque_tokens() {
         for flag in ["--token", "--code"] {
-            let args = Args::try_parse_from(["connector-client", flag, "oil23456"]).unwrap();
+            let args = Args::try_parse_from([
+                "connector-client",
+                "--url",
+                "wss://example.com/link?name=fixture",
+                flag,
+                "oil23456",
+            ])
+            .unwrap();
             assert_eq!(args.token.or(args.code).as_deref(), Some("oil23456"));
         }
         assert_eq!(token_header("oil23456").unwrap(), "Bearer oil23456");

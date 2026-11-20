@@ -14,19 +14,18 @@ Controller -- MCP/HTTPS --> Worker / Durable Object -- MCP/WebSocket --> Native 
                          Sayuri auth   R2 releases                shell/files/desktop
 ```
 
-Production has used Cloudflare since 2026-11-04. Token management is at
-`https://token.ylxdzsw.com/`; the controller endpoint is
-`https://connector.ylxdzsw.com/mcp`. The gateway has no local Unix sockets and
-does not accept the retired connection codes, OAuth grants, or Nginx identity
-header. Controller OAuth remains supported by the Worker. Deployment state and
-release provenance belong in `/root/sayuri/connector/DEPLOYMENT.md`.
+Connector management is at `https://connector.ylxdzsw.com/`; the controller
+endpoint is `https://connector.ylxdzsw.com/mcp`. Both native links and
+controllers use Sayuri bearer tokens. Deployment state and release provenance
+belong in `/root/sayuri/connector/DEPLOYMENT.md`.
 
 ## Connect a machine
 
-Obtain a Sayuri token with capability `connector:client:<name>`, then run:
+Create a client token at `https://connector.ylxdzsw.com/`, reveal it, and use
+the generated bootstrap command or pass the named URL to a downloaded client:
 
 ```sh
-connector-client
+connector-client --url 'wss://connector.ylxdzsw.com/link?name=desktop'
 ```
 
 The hidden `Connector token:` prompt reads `/dev/tty` on Unix or the console on
@@ -37,8 +36,8 @@ normalization**. Credentials are not read from environment variables. Protect
 command-line tokens from process inspection and shell history; never log or
 commit them.
 
-The default gateway is `https://connector.ylxdzsw.com`. `--gateway` accepts an
-HTTP(S) base URL; HTTP is unencrypted and only for trusted local testing.
+`--url` takes the complete WebSocket URL. The gateway requires exactly one
+`name` query parameter. Use `wss://` outside trusted local testing.
 Transient failures reconnect with delays up to 30 seconds; HTTP 4xx admission
 failures stop the client. Reconnection never replays operations.
 
@@ -64,9 +63,9 @@ The native tools omit `client`; `notes_metadata()` is a read-only link tool,
 not a controller tool. The gateway terminates both MCP sessions, maps request
 IDs and cancellation, and relays complete content including images.
 
-Sayuri client capability `connector:client:<name>` authenticates one named
-link; `connector:control` authorizes controller access, as does a Worker-issued
-controller OAuth token. These are distinct authorizations. A client token does
+The gateway checks `connector:client:<name>` for the name in the URL, using
+literal prefix matching. `connector:control` authorizes fleet-wide controller
+access. These are distinct authorizations. A client token does
 not itself authorize control. An authorized controller can operate all
 connected clients with the privileges of their launching OS users. Connector
 is not a sandbox and does not elevate privileges.

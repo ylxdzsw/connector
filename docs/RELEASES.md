@@ -144,5 +144,6 @@ fetch the exact immutable key, and check SHA-256 before executing. Checksums
 protect byte integrity relative to the trusted manifest; they are not a
 signature or protection against a compromised publisher. Serve the stable
 pointer with revalidation/no-cache and immutable versioned binaries with long
-cache lifetimes. Bootstrap scripts pass `--token`, never normalize it, and
-must not print or persist the token in download logs.
+cache lifetimes. Bootstrap scripts pass the named link with `--url` and the
+separate opaque credential with `--token`. Do not log or normalize the key.
+The named-URL release must be cut over together with the matching bootstraps.

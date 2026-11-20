@@ -44,11 +44,11 @@ async fn request(
 async fn native_link_executes_platform_shell_and_patches() {
     let home = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let gateway = format!("http://{}", listener.local_addr().unwrap());
+    let endpoint = format!("ws://{}/link?name=fixture", listener.local_addr().unwrap());
     // A local-only fixture credential, never registered with the public gateway.
     let credential = format!("MiXeD-{}", rand::random::<u128>());
     let mut child = Command::new(env!("CARGO_BIN_EXE_connector-client"))
-        .args(["--gateway", &gateway, "--token", &credential])
+        .args(["--url", &endpoint, "--token", &credential])
         .env("HOME", home.path())
         .env("USERPROFILE", home.path())
         .env("RUST_LOG", "off")
@@ -66,6 +66,7 @@ async fn native_link_executes_platform_shell_and_patches() {
         stream,
         |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
             assert_eq!(request.uri().path(), "/link");
+            assert_eq!(request.uri().query(), Some("name=fixture"));
             assert!(request.headers()["Authorization"] == format!("Bearer {credential}"));
             Ok(response)
         },

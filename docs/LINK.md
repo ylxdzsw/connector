@@ -6,17 +6,17 @@ Object gateway in `/root/sayuri/connector`. Native source:
 
 ## Admission and transport
 
-- The native client opens `GET /link` with a WebSocket upgrade and
-  `Authorization: Bearer <token>`. No credentials in URLs or environment
-  variables. The Worker authorizes the case-sensitive Sayuri token for
-  `connector:client:<name>` before accepting the link; the native process does
-  not interpret capabilities. `/mcp` separately requires `connector:control`.
+- The native client opens `GET /link?name=<id>` with a WebSocket upgrade and
+  `Authorization: Bearer <token>`. The gateway requires exactly one name of
+  1–64 ASCII letters, digits, underscores, or hyphens. It checks
+  `connector:client:<id>` by literal prefix; it does not infer an identity.
+  `/mcp` separately requires `connector:control`.
+- `--url` takes the full `wss://` connection URL with its name. Native Rustls
+  validates public certificates; `ws://` is for trusted local tests only.
+  A local WS test does not validate production WSS.
 - `--token`, the hidden console prompt, and the compatibility alias `--code`
-  preserve the exact opaque token; there is no connection-code normalization.
-  Bootstrap scripts use `--token`.
-- HTTP(S) `--gateway` defaults to `https://connector.ylxdzsw.com` and maps to
-  WS(S) `/link`. Native Rustls validates public certificates. HTTP is for
-  trusted local tests only. A local WS test does not validate production WSS.
+  preserve the exact opaque token. Bootstrap scripts pass it separately from
+  the URL. No credentials in URLs or environment variables.
 - One complete UTF-8 JSON-RPC message per WebSocket text message, no batches,
   newline framing, binary messages, private hello, auth message, or heartbeat.
 - The gateway is the **MCP client**; the native process is the **MCP server**.

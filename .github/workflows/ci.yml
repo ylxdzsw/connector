@@ -72,8 +72,8 @@ jobs:
           $start.Environment['RUST_LOG'] = 'off'
           $start.Environment['USERPROFILE'] = Join-Path $env:RUNNER_TEMP 'connector-smoke-profile'
           $null = New-Item -ItemType Directory -Force $start.Environment['USERPROFILE']
-          $start.ArgumentList.Add('--gateway')
-          $start.ArgumentList.Add('https://connector.ylxdzsw.com')
+          $start.ArgumentList.Add('--url')
+          $start.ArgumentList.Add('wss://connector.ylxdzsw.com/link?name=ci-smoke')
           $start.ArgumentList.Add('--token')
           $start.ArgumentList.Add([guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N'))
           $process = [Diagnostics.Process]::Start($start)
